@@ -1,0 +1,825 @@
+{
+	"Document": {
+		"allowedParents": [],
+		"allowedChildren": [
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"Form",
+			"BlockQuote",
+			"TOC",
+			"Index",
+			"Note"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Part": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art"
+		],
+		"allowedChildren": [
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"Form",
+			"Link",
+			"BlockQuote",
+			"Caption",
+			"TOC",
+			"Index"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Sect": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art"
+		],
+		"allowedChildren": [
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"Form",
+			"Link",
+			"BlockQuote",
+			"Caption",
+			"TOC",
+			"Index",
+			"Note"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Div": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art"
+		],
+		"allowedChildren": [
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"Form",
+			"Link",
+			"BlockQuote",
+			"Caption",
+			"TOC",
+			"Index",
+			"Artifact"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Art": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art"
+		],
+		"allowedChildren": [
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"Form",
+			"Link",
+			"BlockQuote",
+			"Caption",
+			"TOC",
+			"Index"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"P": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"LI",
+			"LBody",
+			"TD",
+			"TH",
+			"BlockQuote",
+			"Note"
+		],
+		"allowedChildren": [
+			"Span",
+			"Link",
+			"Reference",
+			"Figure",
+			"Formula",
+			"#TEXT",
+			"Form"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"Span": {
+		"allowedParents": [
+			"P",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"TD",
+			"TH",
+			"Link",
+			"Lbl",
+			"LBody",
+			"Caption"
+		],
+		"allowedChildren": [
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"H1": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"Span",
+			"Link",
+			"Reference",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"H2": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"Span",
+			"Link",
+			"Reference",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"H3": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"Span",
+			"Link",
+			"Reference",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"H4": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"Span",
+			"Link",
+			"Reference",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"H5": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"Span",
+			"Link",
+			"Reference",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"H6": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"Span",
+			"Link",
+			"Reference",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"L": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH",
+			"LBody"
+		],
+		"allowedChildren": [
+			"LI"
+		],
+		"requiredChildren": [
+			"LI"
+		],
+		"requiredChecks": []
+	},
+	"LI": {
+		"allowedParents": [
+			"L"
+		],
+		"allowedChildren": [
+			"Lbl",
+			"LBody"
+		],
+		"requiredChildren": [
+			"LBody"
+		],
+		"requiredChecks": []
+	},
+	"Lbl": {
+		"allowedParents": [
+			"LI",
+			"Note"
+		],
+		"allowedChildren": [
+			"Span",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"LBody": {
+		"allowedParents": [
+			"LI"
+		],
+		"allowedChildren": [
+			"P",
+			"Span",
+			"Link",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"Div",
+			"Note",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Table": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH",
+			"LBody"
+		],
+		"allowedChildren": [
+			"Caption",
+			"THead",
+			"TBody",
+			"TFoot",
+			"TR"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"THead": {
+		"allowedParents": [
+			"Table"
+		],
+		"allowedChildren": [
+			"TR"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"TBody": {
+		"allowedParents": [
+			"Table"
+		],
+		"allowedChildren": [
+			"TR"
+		],
+		"requiredChildren": [
+			"TR"
+		],
+		"requiredChecks": []
+	},
+	"TFoot": {
+		"allowedParents": [
+			"Table"
+		],
+		"allowedChildren": [
+			"TR"
+		],
+		"requiredChildren": [
+			"TR"
+		],
+		"requiredChecks": []
+	},
+	"TR": {
+		"allowedParents": [
+			"Table",
+			"THead",
+			"TBody",
+			"TFoot"
+		],
+		"allowedChildren": [
+			"TH",
+			"TD"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"TH": {
+		"allowedParents": [
+			"TR"
+		],
+		"allowedChildren": [
+			"P",
+			"Span",
+			"Link",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"#TEXT",
+			"Reference"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"TD": {
+		"allowedParents": [
+			"TR"
+		],
+		"allowedChildren": [
+			"P",
+			"Span",
+			"Link",
+			"L",
+			"Table",
+			"Figure",
+			"Formula",
+			"#TEXT",
+			"Form",
+			"Reference"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Figure": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"TD",
+			"TH",
+			"LBody"
+		],
+		"allowedChildren": [
+			"Caption",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Formula": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"TD",
+			"TH",
+			"LBody"
+		],
+		"allowedChildren": [
+			"Caption",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Form": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"TD",
+			"TH",
+			"LBody"
+		],
+		"allowedChildren": [
+			"#TEXT",
+			"Span"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Link": {
+		"allowedParents": [
+			"P",
+			"Span",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"TD",
+			"TH",
+			"LBody",
+			"Caption",
+			"Reference"
+		],
+		"allowedChildren": [
+			"Span",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Caption": {
+		"allowedParents": [
+			"Figure",
+			"Table",
+			"Formula"
+		],
+		"allowedChildren": [
+			"P",
+			"Span",
+			"Link",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"BlockQuote": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"P",
+			"L",
+			"Table"
+		],
+		"requiredChildren": [
+			"P"
+		],
+		"requiredChecks": []
+	},
+	"Note": {
+		"allowedParents": [
+			"P",
+			"Sect",
+			"Div",
+			"Art",
+			"TD",
+			"TH",
+			"LBody"
+		],
+		"allowedChildren": [
+			"#TEXT",
+			"P",
+			"Span",
+			"Link",
+			"L",
+			"Lbl"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"TOC": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art"
+		],
+		"allowedChildren": [
+			"TOCI"
+		],
+		"requiredChildren": [
+			"TOCI"
+		],
+		"requiredChecks": []
+	},
+	"TOCI": {
+		"allowedParents": [
+			"TOC"
+		],
+		"allowedChildren": [
+			"Reference",
+			"Link",
+			"Span",
+			"P"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Reference": {
+		"allowedParents": [
+			"P",
+			"H1",
+			"H2",
+			"H3",
+			"H4",
+			"H5",
+			"H6",
+			"Caption",
+			"TOCI",
+			"TH",
+			"TD"
+		],
+		"allowedChildren": [
+			"Span",
+			"#TEXT",
+			"Link"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"BibEntry": {
+		"allowedParents": [
+			"Div",
+			"Sect",
+			"Part",
+			"Art"
+		],
+		"allowedChildren": [
+			"P",
+			"Span",
+			"Link"
+		],
+		"requiredChildren": [
+			"P"
+		],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"Code": {
+		"allowedParents": [
+			"P",
+			"Div",
+			"Sect",
+			"Art",
+			"Part"
+		],
+		"allowedChildren": [
+			"Span",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"Annot": {
+		"allowedParents": [
+			"P",
+			"Span",
+			"Div",
+			"Sect",
+			"Art"
+		],
+		"allowedChildren": [],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Quote": {
+		"allowedParents": [
+			"P",
+			"Caption",
+			"Note",
+			"TD",
+			"TH"
+		],
+		"allowedChildren": [
+			"Span",
+			"#TEXT"
+		],
+		"requiredChildren": [],
+		"requiredChecks": [
+			"HAS_CONTENT"
+		]
+	},
+	"Private": {
+		"allowedParents": [
+			"*"
+		],
+		"allowedChildren": [
+			"*"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Index": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art"
+		],
+		"allowedChildren": [
+			"Reference",
+			"Link",
+			"Span",
+			"P"
+		],
+		"requiredChildren": [],
+		"requiredChecks": []
+	},
+	"Artifact": {
+		"allowedParents": [
+			"Document",
+			"Part",
+			"Sect",
+			"Div",
+			"Art",
+			"P",
+			"L",
+			"LI",
+			"LBody",
+			"Table",
+			"THead",
+			"TBody",
+			"TFoot",
+			"TR",
+			"TH",
+			"TD",
+			"Figure",
+			"Caption",
+			"Note"
+		],
+		"allowedChildren": [],
+		"requiredChildren": [],
+		"requiredChecks": []
+	}
+}

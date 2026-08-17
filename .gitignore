@@ -1,0 +1,42 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+*.log
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# .NET
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Rider / ReSharper
+_ReSharper*/
+*.DotSettings.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local settings
+appsettings.Development.json
+appsettings.Local.json
+
+# CLI outputs
+out/
+tmp/
+
+# Claude Code artefacts (per git-dotnet-commit skill)
+CLAUDE.md
+.claude/

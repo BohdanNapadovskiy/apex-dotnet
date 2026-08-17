@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Apex.PdfEdit.Core</RootNamespace>
+    <AssemblyName>Apex.PdfEdit.Core</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Bundled Rev 1.2 schema. Loaded via Assembly.GetManifestResourceStream in SchemaLoader. -->
+    <EmbeddedResource Include="Resources\schema\tag-validation-rev1.2.json">
+      <LogicalName>Apex.PdfEdit.Core.Resources.schema.tag-validation-rev1.2.json</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Tests reach into internal helpers (RasterizedTextStamper.AlignedStartXPx,
+         OcrRevectorizeWriter.AlignedStartX, EditEngine.PruneShiftChain, etc.). -->
+    <InternalsVisibleTo Include="Apex.PdfEdit.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- iText 9 for .NET. PDF/UA classes ship inside the main `itext` package
+         (no separate `itext.pdfua` NuGet exists on .NET, unlike Java). -->
+    <PackageReference Include="itext" />
+    <PackageReference Include="itext.commons" />
+    <!-- iText 9 for .NET requires an explicit BouncyCastle adapter — Java gets it transitively. -->
+    <PackageReference Include="itext.bouncy-castle-adapter" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <!-- SkiaSharp — .NET replacement for Java AWT (used by RasterizedTextStamper +
+         SourcePdfFontResolver's OCR-raster glyph-outline rescue path). NativeAssets
+         packages ship the platform-specific libSkiaSharp binaries. -->
+    <PackageReference Include="SkiaSharp" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" />
+    <PackageReference Include="SkiaSharp.NativeAssets.macOS" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" />
+  </ItemGroup>
+
+</Project>
