@@ -252,7 +252,39 @@ public sealed class PageFontInventory
         output.AddRange(weightType0);
         output.AddRange(otherSimple);
         output.AddRange(otherType0);
-        return output;
+        return OrderExactNameFirst(output, family);
+    }
+
+    /// <summary>
+    /// Stable-reorder: fonts whose FULL PostScript name (subset prefix stripped) equals the
+    /// requested family come first. <see cref="FamilyStem"/> cuts at the first '-', so
+    /// "UniversCom-45Light" and "UniversCom-47LightCond" share a stem — without this
+    /// preference a stem-only walk can dress body text in the condensed twin (Bessemer p2
+    /// addListItem picked 47LightCond over the donor's 45Light).
+    /// </summary>
+    private static List<PdfFont> OrderExactNameFirst(List<PdfFont> fonts, string? family)
+    {
+        var target = FullNameKey(family);
+        if (target.Length == 0 || fonts.Count < 2) return fonts;
+        var exact = new List<PdfFont>();
+        var rest = new List<PdfFont>();
+        foreach (var f in fonts)
+        {
+            if (string.Equals(FullNameKey(BaseFontName(f)), target, StringComparison.Ordinal)) exact.Add(f);
+            else rest.Add(f);
+        }
+        if (exact.Count == 0) return fonts;
+        exact.AddRange(rest);
+        return exact;
+    }
+
+    /// <summary>Full font name normalized for comparison: subset prefix stripped, lowercase.</summary>
+    internal static string FullNameKey(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return string.Empty;
+        int plus = s.IndexOf('+');
+        if (plus >= 0 && plus <= 6) s = s[(plus + 1)..];
+        return s.ToLowerInvariant();
     }
 
     /// <summary>
@@ -308,7 +340,7 @@ public sealed class PageFontInventory
         output.AddRange(weightType0);
         output.AddRange(otherSimple);
         output.AddRange(otherType0);
-        return output;
+        return OrderExactNameFirst(output, family);
     }
 
     /// <summary>True if <paramref name="f"/> is a Type0/CID composite font.</summary>

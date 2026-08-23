@@ -248,6 +248,20 @@ internal static class AddListItemStamper
             {
                 if (inv.CanRenderStrict(candidate, text)) return candidate;
             }
+            // Tier 2.5: exact-full-name twins that pass the cmap check. Strict can
+            // false-negative on the writer-side doc (rendered-chars scan runs on the
+            // already-mutated streams), and a subset's pruned cmap is an honest coverage
+            // signal for the very font the donor text renders with. Falling through to
+            // the universal fallback here would swap the face entirely — worse than
+            // trusting the cmap of the same-named twin.
+            var targetName = PageFontInventory.FullNameKey(style.Family);
+            foreach (var candidate in inv.CandidatesByFamilyAndWeight(style.Family, style.Weight))
+            {
+                var candName = PageFontInventory.FullNameKey(
+                    candidate.GetFontProgram()?.GetFontNames()?.GetFontName());
+                if (!string.Equals(candName, targetName, StringComparison.Ordinal)) continue;
+                if (PageFontInventory.CanRender(candidate, text)) return candidate;
+            }
         }
         // Tier 3: fresh system font.
         if (!string.IsNullOrWhiteSpace(style.Family))
