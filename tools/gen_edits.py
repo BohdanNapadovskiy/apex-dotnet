@@ -30,14 +30,16 @@ def load(folder):
         return None
     doc = json.loads(doc_path.read_text(encoding="utf-8-sig"))
     edits = json.loads(edits_path.read_text(encoding="utf-8-sig"))
-    return doc, edits, edits_path
+    geom_path = folder / f"{name}-geometry.json"
+    geom = json.loads(geom_path.read_text(encoding="utf-8-sig")) if geom_path.exists() else {}
+    return doc, edits, edits_path, geom
 
 def build(folder):
     loaded = load(folder)
     if loaded is None:
         print(f"SKIP {folder.name}: missing document/edits json")
         return
-    doc, edits, edits_path = loaded
+    doc, edits, edits_path, geom = loaded
     tree = doc["tree"]
     by_id = {n["id"]: n for n in tree}
     children = {}
@@ -93,9 +95,49 @@ def build(folder):
                 return True
         return False
 
+    # Marked-content ids per page that no tree node owns. Their words are drawn text the
+    # engine cannot redact (PLATO p1: node 19's second line tail is orphan mcid 20 —
+    # setText left the old tail behind next to the replacement).
+    tree_mcids = {}
+    for n in tree:
+        if n["mcid"] >= 0:
+            tree_mcids.setdefault(n["page"], set()).add(n["mcid"])
+    orphan_words = {}
+    for page_str, mcids in (geom.get("pageMcidWords") or {}).items():
+        page = int(page_str)
+        for mcid_str, words in mcids.items():
+            if int(mcid_str) in tree_mcids.get(page, set()):
+                continue
+            orphan_words.setdefault(page, []).extend(words)
+
+    def contains_orphan_words(n):
+        for w in orphan_words.get(n["page"], []):
+            cx = w["X"] + w["Width"] / 2
+            cy = w["Y"] + w["Height"] / 2
+            if n["x"] < cx < n["x"] + n["width"] and n["y"] < cy < n["y"] + n["height"]:
+                return True
+        return False
+
+    # Form-field widgets embedded mid-paragraph (fill-in blanks). The writer re-wraps
+    # replacement text from the bbox left edge, running it underneath the widgets.
+    form_nodes = {}
+    for m in tree:
+        if m.get("text") == "Form" and has_bbox(m):
+            form_nodes.setdefault(m["page"], []).append(m)
+
+    def contains_form_widget(n):
+        for m in form_nodes.get(n["page"], []):
+            cx = m["x"] + m["width"] / 2
+            cy = m["y"] + m["height"] / 2
+            if n["x"] < cx < n["x"] + n["width"] and n["y"] < cy < n["y"] + n["height"]:
+                return True
+        return False
+
     def safe_target(n):
         return (n.get("text") != "Link" and not overlaps_other_leaf(n)
-                and fits_bbox(n) and not inline_continuation(n))
+                and fits_bbox(n) and not inline_continuation(n)
+                and not contains_orphan_words(n)
+                and not contains_form_widget(n))
 
     existing_ops = [o for o in edits.get("operations", []) if not o["id"].startswith("gen-")]
     used_targets = set()
@@ -247,6 +289,29 @@ def build(folder):
         if not (has_bbox(lbl) and has_bbox(lbody)):
             continue
         if min(lbl["y"], lbody["y"]) < 150:
+            continue
+        # Placement pre-check (mirrors the addPara guard): the engine lands the new item
+        # below the list's lowest child and can refuse (or push into) close neighbours.
+        row_left = min(lbl["x"], lbody["x"])
+        row_right = max(lbl["x"] + lbl["width"], lbody["x"] + lbody["width"])
+        est_h = 2 * max(lbl["height"], lbody["height"]) + 20
+        new_y = min(lbl["y"], lbody["y"]) - 6 - est_h
+        li_ids = set()
+        stack = list(kids(n["id"]))
+        while stack:
+            c = stack.pop()
+            li_ids.add(c["id"])
+            stack.extend(kids(c["id"]))
+        collides = False
+        for m in leaves_by_page.get(lbody["page"], []):
+            if m["id"] in li_ids:
+                continue
+            ox = min(row_right, m["x"] + m["width"]) - max(row_left, m["x"])
+            oy = min(new_y + est_h, m["y"] + m["height"]) - max(new_y, m["y"])
+            if ox > 1 and oy > 1:
+                collides = True
+                break
+        if collides:
             continue
         # Bullet-list Lbl glyphs are often absent from extracted content; "•" survives
         # the donor-font-subset check while "-" renders as a visibly wrong label.
