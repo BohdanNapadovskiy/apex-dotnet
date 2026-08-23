@@ -228,7 +228,8 @@ public sealed class RasterizedTextStamper
         {
             if (!string.IsNullOrEmpty(line))
             {
-                DrawLine(canvas, line, font, fill, stroke ? strokePaint : null,
+                DrawLine(canvas, SymbolicCmapFallback.RemapLine(font, line), font,
+                    fill, stroke ? strokePaint : null,
                     widthPx, baselineYPt * scale, align, rng, jitterMaxPx);
             }
             baselineYPt += lineHeight;

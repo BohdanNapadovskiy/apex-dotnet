@@ -199,8 +199,49 @@ public sealed class SourcePdfFontResolver : IDisposable
         if (refr is null) return null;
         if (_skiaTypefaceByFontRef.TryGetValue(refr, out var cached)) return cached;
         var result = ExtractSkiaTypeface(obj);
+        result = RescueCmaplessTypeface(result, font);
         _skiaTypefaceByFontRef[refr] = result;
         return result;
+    }
+
+    /// <summary>
+    /// ABBYY-style Type0/Identity-H subsets often ship the full glyf table but strip the
+    /// cmap entirely — Skia then maps every code point to .notdef, so both the widened
+    /// glyph guard and the raster stamper would silently produce empty glyphs. Java's AWT
+    /// refuses such fonts outright, which is no better. Rescue: load the same family from
+    /// the OS font directory (the embedded program is a subset OF that installed font),
+    /// so cmap lookups and stamping use real outlines of the identical face.
+    /// </summary>
+    private static SKTypeface? RescueCmaplessTypeface(SKTypeface? extracted, PdfFont font)
+    {
+        if (extracted is null || extracted.GlyphCount == 0) return extracted;
+
+        // Probe a spread of common chars — a usable cmap maps at least one of them.
+        foreach (int cp in stackalloc int[] { 'A', 'a', 'e', '0', ' ' })
+        {
+            using var probe = new SKFont(extracted);
+            if (SymbolicCmapFallback.GlyphId(probe, cp) != 0) return extracted;
+        }
+
+        var family = font.GetFontProgram()?.GetFontNames()?.GetFontName();
+        if (string.IsNullOrWhiteSpace(family)) return extracted;
+        // Strip the "ABCDEF+" subset prefix.
+        int plus = family.IndexOf('+');
+        if (plus >= 0 && plus < family.Length - 1) family = family[(plus + 1)..];
+
+        var path = SystemFontLocator.LocateFile(new FontStyle(family, 12f, "regular", null));
+        if (path is null) return extracted;
+        try
+        {
+            var system = SKTypeface.FromFile(path);
+            if (system is null || system.GlyphCount == 0) return extracted;
+            extracted.Dispose();
+            return system;
+        }
+        catch
+        {
+            return extracted;
+        }
     }
 
     private static SKTypeface? ExtractSkiaTypeface(PdfObject fontObj)
@@ -243,10 +284,7 @@ public sealed class SourcePdfFontResolver : IDisposable
     private static bool SkiaHasGlyph(SKTypeface typeface, int cp)
     {
         using var font = new SKFont(typeface);
-        ReadOnlySpan<int> cps = stackalloc int[] { cp };
-        Span<ushort> glyphs = stackalloc ushort[1];
-        font.GetGlyphs(cps, glyphs);
-        return glyphs[0] != 0;
+        return SymbolicCmapFallback.GlyphId(font, cp) != 0;
     }
 
     private HashSet<int>? FontRenderedChars(PdfFont font)
