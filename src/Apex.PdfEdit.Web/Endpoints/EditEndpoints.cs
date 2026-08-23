@@ -73,7 +73,7 @@ public static class EditEndpoints
 
         try
         {
-            using var output = File.OpenWrite(outputFile);
+            using var output = File.Create(outputFile);
             var result = editService.Edit(sourceFile!, documentJson, geometryJson, editsFile!, output);
             log.LogInformation("[edit-api] edit OK  applied={A} issues={I} -> {Out}",
                 result.AppliedOpIds.Count, result.Issues.Count, outputFile);

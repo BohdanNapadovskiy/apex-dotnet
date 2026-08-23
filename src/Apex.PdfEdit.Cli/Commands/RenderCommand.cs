@@ -66,7 +66,7 @@ public static class RenderCommand
         if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
 
         sw.Restart();
-        using (var stream = File.OpenWrite(outPath))
+        using (var stream = File.Create(outPath))
         {
             new SourceBasedWriter(sourcePath).Write(stream);
         }

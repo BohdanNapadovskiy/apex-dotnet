@@ -71,7 +71,7 @@ public static class RenderOcrCommand
         if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
 
         using (var resolver = new SourcePdfFontResolver(sourcePath))
-        using (var stream = File.OpenWrite(outPath))
+        using (var stream = File.Create(outPath))
         {
             bool isOcr = ScanDetector.IsScannedOcr(resolver.SourceDocument);
             log.LogInformation("[render-ocr] scan detected: {IsOcr}  sourcePages={P}",

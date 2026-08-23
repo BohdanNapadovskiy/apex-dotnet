@@ -78,7 +78,7 @@ public static class EditOcrCommand
 
         EditResult result;
         using (var resolver = new SourcePdfFontResolver(sourcePath))
-        using (var stream = File.OpenWrite(outPath))
+        using (var stream = File.Create(outPath))
         {
             // Detect scan mode BEFORE the engine runs so setText's glyph guard can pick the
             // widened SkiaSharp-outline rescue on OCR docs.

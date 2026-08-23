@@ -79,7 +79,7 @@ public static class EditCommand
 
         EditResult result;
         using (var resolver = new SourcePdfFontResolver(sourcePath))
-        using (var stream = File.OpenWrite(outPath))
+        using (var stream = File.Create(outPath))
         {
             log.LogInformation("[edit] resolver opened  sourcePages={P}",
                 resolver.SourceDocument.GetNumberOfPages());
