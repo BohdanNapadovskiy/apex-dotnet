@@ -433,8 +433,14 @@ public sealed class EditEngine
 
         ShiftOrphanGeometryMcids(doc, geom, page, y + height, toShift, shiftAmount, plan);
 
-        var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, x, x + width);
-        plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount, bandLeft, bandRight));
+        // No pushed-down content → no decoration shift. Emitting the band anyway drags
+        // full-width artifact rects (section header fills) down while their white text
+        // stays put (Bessemer p4). Diverges from Java like the exclusions above — §9.
+        if (toShift.Count > 0)
+        {
+            var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, x, x + width);
+            plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount, bandLeft, bandRight));
+        }
     }
 
     private void ApplyAddListItem(AddListItemOp op, DocumentJson doc, GeometryJson? geom,
@@ -669,8 +675,12 @@ public sealed class EditEngine
 
         ShiftOrphanGeometryMcids(doc, geom, page, newY + height, toShift, shiftAmount, plan);
 
-        var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, columnLeft, columnRight);
-        plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount, bandLeft, bandRight));
+        // See ApplyAddParagraph: an empty shift chain must not emit a path band.
+        if (toShift.Count > 0)
+        {
+            var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, columnLeft, columnRight);
+            plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount, bandLeft, bandRight));
+        }
     }
 
     private List<TreeNode> CollectShiftTargetsFromRoots(DocumentJson doc,
