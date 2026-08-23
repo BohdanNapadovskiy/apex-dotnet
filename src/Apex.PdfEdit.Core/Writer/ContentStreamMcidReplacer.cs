@@ -88,6 +88,13 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     // Effective per-character kerning from source's first TJ inside the target BDC (1/1000 em).
     private double? _firstTjAvgKernPer1000;
 
+    // Source's current text render mode (Tr). Null until the first Tr op on the page.
+    private int? _lastTrMode;
+
+    // The Tm in effect when _firstTjDyInBlock was captured — the frame that dy is
+    // measured against (mid-block Tm resets must not retarget it).
+    private IList<PdfObject>? _tmAtFirstTjInBlock;
+
     private ContentStreamMcidReplacer(
         IReadOnlyDictionary<int, SetTextOverlay> byMcid,
         WriterFontCache? fontCache,
@@ -136,7 +143,18 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         // Flip the text-object flag at the TOP so a suppressed ET (inside the target block)
         // still updates our state — the suppression branch returns early.
-        if ("BT".Equals(opName, StringComparison.Ordinal)) _insideTextObject = true;
+        if ("BT".Equals(opName, StringComparison.Ordinal))
+        {
+            _insideTextObject = true;
+            // BT resets Tm/Tlm to identity (ISO 32000-1 §9.4.1), so both the tracked Tm and
+            // the cumulative Td/TD/T* offsets are stale beyond this point. Without this reset,
+            // a Td-only block on a page with several prior BT text objects sums their Td Ys
+            // (2026 Proxy p3: 4 BTs → baseline 2761pt, off-page). Diverges from the Java
+            // reference, which carries the same latent bug — see PORTING_PLAN §9.
+            _lastTmOperands = null;
+            _dxSinceLastTm = 0;
+            _dySinceLastTm = 0;
+        }
         else if ("ET".Equals(opName, StringComparison.Ordinal)) _insideTextObject = false;
 
         // Snapshot text-state ops so we can restore them post-injection.
@@ -147,7 +165,12 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         else if ("Tm".Equals(opName, StringComparison.Ordinal))
         {
             _lastTmOperands = new List<PdfObject>(operands);
-            if (_activeTargetMcid >= 0 && _firstTmInBlock is null)
+            // Opening-intent guard (same as Tc/Tw below): a Tm AFTER the block's first
+            // text-showing op is a mid-block reposition for the NEXT fragment (CARE p1
+            // re-sets Tm to the paragraph top inside TD-chain blocks) — trusting it as
+            // the block baseline stamped replacements ~100pt off. Diverges from Java,
+            // which captures any first Tm — see PORTING_PLAN §9.
+            if (_activeTargetMcid >= 0 && _firstTmInBlock is null && _firstTjDyInBlock is null)
             {
                 _firstTmInBlock = new List<PdfObject>(operands);
             }
@@ -176,6 +199,11 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         else if ("TD".Equals(opName, StringComparison.Ordinal) && operands.Count >= 2)
         {
             if (operands[1] is PdfNumber n) _lastLeading = -n.DoubleValue();
+        }
+        else if ("Tr".Equals(opName, StringComparison.Ordinal) && operands.Count > 0)
+        {
+            // Text state — persists across BT/ET per ISO 32000-1 §9.3.1, so no BT reset.
+            if (operands[0] is PdfNumber n) _lastTrMode = n.IntValue();
         }
 
         // Track source's cumulative Td/TD/T* GLOBALLY. Tm resets — Td/TD/T* between the Tm
@@ -227,6 +255,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             _firstTwInBlock = null;
             _firstTmInBlock = null;
             _firstTjDyInBlock = null;
+            _tmAtFirstTjInBlock = null;
             _tcAtBdcOpen = null;
             _twAtBdcOpen = null;
             _firstTjAvgKernPer1000 = null;
@@ -240,6 +269,11 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             if (_firstTjDyInBlock is null && IsTextShowingOp(opName))
             {
                 _firstTjDyInBlock = _dySinceLastTm;
+                // Freeze the Tm this dy is measured against. Mid-block Tm resets (CARE p1
+                // repositions later lines with fresh Tms) would otherwise pair the first-Tj
+                // dy with an unrelated end-of-block Tm, throwing the baseline ~100pt off.
+                // Diverges from Java, which uses the emit-time lastTm — see PORTING_PLAN §9.
+                _tmAtFirstTjInBlock = _lastTmOperands;
                 _firstTjAvgKernPer1000 = AverageTjKerningPer1000(opName, operands);
             }
             // Drop the source's original text op.
@@ -291,8 +325,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         }
         else if (_firstTjDyInBlock is { } dy)
         {
-            float? tmScaleD = TmDFromOperands(_lastTmOperands);
-            float? tmTransF = TmYFromOperands(_lastTmOperands);
+            // dy and its Tm frame were frozen together at the first Tj. A null frozen Tm
+            // means the frame was IDENTITY (BT reset, no Tm before the Tj) — falling back
+            // to _lastTmOperands here would add an unrelated mid/post-block Tm's Y on top
+            // of a dy already measured from identity (2026 Proxy p3: 657.78 + 670.06 →
+            // baseline 1327.84, off-page).
+            var tmForDy = _tmAtFirstTjInBlock;
+            float? tmScaleD = TmDFromOperands(tmForDy);
+            float? tmTransF = TmYFromOperands(tmForDy);
             double scale = tmScaleD ?? 1.0;
             double trans = tmTransF ?? 0.0;
             baselineY = (float)(trans + scale * dy);
@@ -354,6 +394,15 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         // Two-branch emit — see Java Javadoc for the state-machine rationale.
         if (!_insideTextObject) _outCanvas.BeginText();
+
+        // Preserve source's text render mode. Cover pages (2026 Proxy p1) tag an INVISIBLE
+        // (3 Tr) text layer over vector artwork; emitting the replacement at the default
+        // mode 0 paints it on top of the untouched art, doubling the title. Not handled by
+        // the Java reference — see PORTING_PLAN §9.
+        if (_lastTrMode is { } tr && tr != PdfCanvasConstants.TextRenderingMode.FILL)
+        {
+            _outCanvas.SetTextRenderingMode(tr);
+        }
 
         // Character-spacing / word-spacing: prefer opening intent, fall back to inherited state.
         IList<PdfObject>? emitTcOperands = _firstTcInBlock ?? _tcAtBdcOpen;
