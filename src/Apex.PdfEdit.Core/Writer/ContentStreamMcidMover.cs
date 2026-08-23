@@ -87,8 +87,17 @@ internal sealed class ContentStreamMcidMover : PdfCanvasProcessor
         ArgumentNullException.ThrowIfNull(page);
         if (shifts is null || shifts.Count == 0) return;
 
+        // SUM per-mcid: sequential push-downs each emit their own overlay for the same
+        // block (form-40x p2: two list inserts moved a heading -32 then -64; last-wins
+        // dropped the first shift while path bands composed both — decorations overshot
+        // their text by exactly the lost dy).
         var byMcid = new Dictionary<int, MoveOverlay>(shifts.Count);
-        foreach (var o in shifts) byMcid[o.Mcid] = o;
+        foreach (var o in shifts)
+        {
+            byMcid[o.Mcid] = byMcid.TryGetValue(o.Mcid, out var prev)
+                ? prev with { Dx = prev.Dx + o.Dx, Dy = prev.Dy + o.Dy }
+                : o;
+        }
 
         var originalBytes = page.GetContentBytes();
         if (originalBytes is null || originalBytes.Length == 0) return;

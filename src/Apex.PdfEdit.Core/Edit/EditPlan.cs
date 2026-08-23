@@ -26,6 +26,8 @@ public sealed class EditPlan
     public IReadOnlyList<MoveOverlay> MoveOverlays { get; }
     public IReadOnlyList<DeleteOverlay> DeleteOverlays { get; }
     public IReadOnlyList<PathBandOverlay> PathBandOverlays { get; }
+    public IReadOnlyList<AnnotShiftOverlay> AnnotShiftOverlays { get; }
+    public IReadOnlyList<DecorShiftOverlay> DecorShiftOverlays { get; }
 
     public EditPlan(
         IEnumerable<SetTextOverlay> setText,
@@ -33,7 +35,9 @@ public sealed class EditPlan
         IEnumerable<AddListItemOverlay> addListItem,
         IEnumerable<MoveOverlay> moves,
         IEnumerable<DeleteOverlay> deletes,
-        IEnumerable<PathBandOverlay> pathBands)
+        IEnumerable<PathBandOverlay> pathBands,
+        IEnumerable<AnnotShiftOverlay>? annotShifts = null,
+        IEnumerable<DecorShiftOverlay>? decorShifts = null)
     {
         SetTextOverlays = setText.ToList().AsReadOnly();
         AddParagraphOverlays = addParagraph.ToList().AsReadOnly();
@@ -41,6 +45,8 @@ public sealed class EditPlan
         MoveOverlays = moves.ToList().AsReadOnly();
         DeleteOverlays = deletes.ToList().AsReadOnly();
         PathBandOverlays = pathBands.ToList().AsReadOnly();
+        AnnotShiftOverlays = (annotShifts ?? Array.Empty<AnnotShiftOverlay>()).ToList().AsReadOnly();
+        DecorShiftOverlays = (decorShifts ?? Array.Empty<DecorShiftOverlay>()).ToList().AsReadOnly();
     }
 
     public static EditPlan Empty()
@@ -64,6 +70,8 @@ public sealed class EditPlan
         private readonly List<MoveOverlay> _moves = new();
         private readonly List<DeleteOverlay> _deletes = new();
         private readonly List<PathBandOverlay> _pathBands = new();
+        private readonly List<AnnotShiftOverlay> _annotShifts = new();
+        private readonly List<DecorShiftOverlay> _decorShifts = new();
 
         public Builder SetText(SetTextOverlay overlay) { _setText.Add(overlay); return this; }
         public Builder AddParagraph(AddParagraphOverlay overlay) { _addParagraph.Add(overlay); return this; }
@@ -71,8 +79,10 @@ public sealed class EditPlan
         public Builder Move(MoveOverlay overlay) { _moves.Add(overlay); return this; }
         public Builder Delete(DeleteOverlay overlay) { _deletes.Add(overlay); return this; }
         public Builder PathBand(PathBandOverlay overlay) { _pathBands.Add(overlay); return this; }
+        public Builder AnnotShift(AnnotShiftOverlay overlay) { _annotShifts.Add(overlay); return this; }
+        public Builder DecorShift(DecorShiftOverlay overlay) { _decorShifts.Add(overlay); return this; }
 
-        public EditPlan Build() => new(_setText, _addParagraph, _addListItem, _moves, _deletes, _pathBands);
+        public EditPlan Build() => new(_setText, _addParagraph, _addListItem, _moves, _deletes, _pathBands, _annotShifts, _decorShifts);
     }
 }
 
@@ -109,7 +119,8 @@ public sealed record SetTextOverlay(
     int Mcid,
     double GlyphBaselineY,
     double NextSiblingTopY,
-    IReadOnlyList<TextRun> SourceRuns)
+    IReadOnlyList<TextRun> SourceRuns,
+    double SourceLeading = 0)
 {
     /// <summary>Back-compat: no NextSiblingTopY, no source runs.</summary>
     public SetTextOverlay(int page, double x, double y, double width, double height,
@@ -224,4 +235,29 @@ public sealed record DeleteOverlay(
 /// left-column bullet insert) must not move. Defaults cover the full page width.
 /// </summary>
 public sealed record PathBandOverlay(int Page, double BandTopY, double Dy,
-    double LeftX = double.NegativeInfinity, double RightX = double.PositiveInfinity);
+    double LeftX = double.NegativeInfinity, double RightX = double.PositiveInfinity,
+    IReadOnlyList<KeepOutRect>? KeepOut = null);
+
+/// <summary>
+/// A pushed-down node's ORIGINAL bbox and its CUMULATIVE dy across all ops. The path
+/// shifter matches untagged decorations (link underlines, heading pills, blank-line
+/// rules) to their owning node and moves them by exactly the owner's total dy —
+/// sequential push-downs with different chains gave band-composition overshoots
+/// (form-40x p2: heading pills moved 96pt while their headings moved 64pt).
+/// </summary>
+public sealed record DecorShiftOverlay(int Page, double X, double Y, double Width, double Height, double Dy);
+
+/// <summary>
+/// Region whose decorations must NOT be swept by a <see cref="PathBandOverlay"/> — the
+/// bbox of a node the engine explicitly EXCLUDED from the shift chain (other column,
+/// above the band). Its text stays put, so its underlines/fills must too (UDO p2: the
+/// left-column TOC link underlines were dragged down by a right-column insert's band).
+/// </summary>
+public sealed record KeepOutRect(double X, double Y, double Width, double Height);
+
+/// <summary>
+/// Translate the page annotation (form-field widget, link) whose /Rect overlaps the
+/// given bbox by <see cref="Dy"/>. Emitted per SHIFTED tree node backed by an annotation
+/// (Form/Link), so annotations follow their pushed-down content and nothing else moves.
+/// </summary>
+public sealed record AnnotShiftOverlay(int Page, double X, double Y, double Width, double Height, double Dy);

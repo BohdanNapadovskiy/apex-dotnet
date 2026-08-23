@@ -94,6 +94,11 @@ public static class EditCommand
                 result.Plan.DeleteOverlays.Count,
                 result.Plan.MoveOverlays.Count,
                 result.Issues.Count, sw.ElapsedMilliseconds);
+            foreach (var issue in result.Issues)
+            {
+                log.LogWarning("[edit] op {OpId} ({OpType}) skipped: {Message}",
+                    issue.OpId, issue.OpType, issue.Message);
+            }
 
             sw.Restart();
             new SourceBasedWriter(sourcePath).Write(result.Plan, stream);

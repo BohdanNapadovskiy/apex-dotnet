@@ -91,6 +91,22 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     // Source's current text render mode (Tr). Null until the first Tr op on the page.
     private int? _lastTrMode;
 
+    // Source's current fill colourspace (cs) and fill colour (scn/sc/rg/g/k) ops. Our
+    // SetFillColor emits DeviceRGB `rg`, silently switching the fill colourspace — later
+    // untagged ops like `1 scn` then resolve against the wrong space (PLATO p1: the
+    // copyright backdrop rect rendered solid black). Restored post-injection.
+    private IList<PdfObject>? _lastFillCsOperands;
+    private IList<PdfObject>? _lastFillColorOperands;
+
+    // Fill colour AND the text-state parameters (Tc/Tw/Tf/TL/Tr) are part of the graphics
+    // state, so q/Q save/restore them (§8.4.2 Table 52) — without this stack a `Q` after a
+    // purple `scn` left the tracker purple (PLATO p1 bullet), and the `BDC Q BT` block
+    // pattern popped a source `Tc` the tracker kept, mis-spacing untouched blocks after a
+    // replacement ("latera l" gaps).
+    private readonly Stack<(IList<PdfObject>? Cs, IList<PdfObject>? Color,
+        IList<PdfObject>? Tc, IList<PdfObject>? Tw, IList<PdfObject>? Tf,
+        double? Leading, int? TrMode)> _gsStack = new();
+
     // The Tm in effect when _firstTjDyInBlock was captured — the frame that dy is
     // measured against (mid-block Tm resets must not retarget it).
     private IList<PdfObject>? _tmAtFirstTjInBlock;
@@ -205,6 +221,39 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             // Text state — persists across BT/ET per ISO 32000-1 §9.3.1, so no BT reset.
             if (operands[0] is PdfNumber n) _lastTrMode = n.IntValue();
         }
+        else if ("cs".Equals(opName, StringComparison.Ordinal))
+        {
+            // Selecting a colourspace resets the fill colour to its initial value (§8.6.8).
+            _lastFillCsOperands = new List<PdfObject>(operands);
+            _lastFillColorOperands = null;
+        }
+        else if (opName is "scn" or "sc")
+        {
+            _lastFillColorOperands = new List<PdfObject>(operands);
+        }
+        else if (opName is "rg" or "g" or "k")
+        {
+            // These select a device colourspace implicitly, replacing any `cs` selection.
+            _lastFillCsOperands = null;
+            _lastFillColorOperands = new List<PdfObject>(operands);
+        }
+        else if ("q".Equals(opName, StringComparison.Ordinal))
+        {
+            _gsStack.Push((_lastFillCsOperands, _lastFillColorOperands,
+                _lastTcOperands, _lastTwOperands, _lastTfOperands, _lastLeading, _lastTrMode));
+        }
+        else if ("Q".Equals(opName, StringComparison.Ordinal) && _gsStack.Count > 0)
+        {
+            (_lastFillCsOperands, _lastFillColorOperands,
+                _lastTcOperands, _lastTwOperands, _lastTfOperands, _lastLeading, _lastTrMode) = _gsStack.Pop();
+            // `BDC Q BT` blocks: the Q right after the BDC pops the state the block will
+            // actually draw with — refresh the at-open snapshots while no text has shown.
+            if (_activeTargetMcid >= 0 && _firstTjDyInBlock is null)
+            {
+                _tcAtBdcOpen = _lastTcOperands is null ? null : new List<PdfObject>(_lastTcOperands);
+                _twAtBdcOpen = _lastTwOperands is null ? null : new List<PdfObject>(_lastTwOperands);
+            }
+        }
 
         // Track source's cumulative Td/TD/T* GLOBALLY. Tm resets — Td/TD/T* between the Tm
         // and BDC are part of source's real cursor position.
@@ -293,6 +342,27 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         _outStream.WriteNewLine();
     }
 
+    /// <summary>
+    /// Writes the fill colour as a raw <c>rg</c> op, bypassing PdfCanvas's colour dedupe:
+    /// the canvas can't see our raw colourspace-restore writes, so its tracked state goes
+    /// stale and SetFillColor would silently skip a needed op (PLATO p1: Name/Date drew
+    /// in the restored white).
+    /// </summary>
+    private void EmitFillColorRaw(iText.Kernel.Colors.Color color)
+    {
+        var v = color.GetColorValue();
+        if (v.Length >= 3)
+        {
+            _outStream.WriteString(string.Format(
+                CultureInfo.InvariantCulture, "{0:0.#####} {1:0.#####} {2:0.#####} rg\n", v[0], v[1], v[2]));
+        }
+        else
+        {
+            _outStream.WriteString(string.Format(
+                CultureInfo.InvariantCulture, "{0:0.#####} g\n", v.Length > 0 ? v[0] : 0f));
+        }
+    }
+
     private void EmitReplacement(SetTextOverlay overlay)
     {
         var style = overlay.Style;
@@ -350,9 +420,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         float bboxHeight = (float)overlay.Height;
         var lines = WrapText(overlay.NewContent, font, fontSize, bboxWidth);
         float lineHeight = fontSize * EffectiveLeadingMultiplier(style);
+        // Prefer the SOURCE block's observed baseline gap over natural leading: a
+        // double-spaced worksheet paragraph re-wrapped at natural leading collapses into
+        // tight lines (PLATO p1). Diverges from Java, which always uses natural — §9.
+        bool hasSourceLeading = overlay.SourceLeading > 0;
+        if (hasSourceLeading) lineHeight = (float)overlay.SourceLeading;
 
-        // Source-single-line preservation.
-        bool sourceIsSingleLine = bboxHeight < lineHeight * 1.5f;
+        // Source-single-line preservation. A measured multi-line gap proves multi-line.
+        bool sourceIsSingleLine = !hasSourceLeading && bboxHeight < lineHeight * 1.5f;
         if (sourceIsSingleLine && lines.Count > 1)
         {
             float requiredWidth = font.GetWidth(overlay.NewContent, fontSize);
@@ -439,12 +514,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 var segFont = ResolveRunFont(seg.Style, font);
                 var segColor = StandardFontMapper.ParseHex(seg.Style.ColorHex);
                 float segSize = seg.Style.Size >= 4.0f ? seg.Style.Size : fontSize;
-                _outCanvas.SetFillColor(segColor).SetFontAndSize(segFont, segSize).ShowText(seg.Text);
+                EmitFillColorRaw(segColor);
+                _outCanvas.SetFontAndSize(segFont, segSize).ShowText(seg.Text);
             }
         }
         else
         {
-            _outCanvas.SetFillColor(color).SetFontAndSize(font, fontSize).SetLeading(lineHeight);
+            EmitFillColorRaw(color);
+            _outCanvas.SetFontAndSize(font, fontSize).SetLeading(lineHeight);
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
@@ -474,6 +551,18 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         {
             _outStream.WriteString(string.Format(
                 CultureInfo.InvariantCulture, "{0:F6} {1:F6} Td\n", _dxSinceLastTm, _dySinceLastTm));
+        }
+        // Undo our SetFillColor's DeviceRGB switch: re-select the source's fill colourspace
+        // and colour so later untagged `scn` ops keep their meaning (PLATO p1 black bar).
+        // Diverges from Java, which leaks the `rg` — see PORTING_PLAN §9.
+        if (_lastFillCsOperands is not null) WriteOperandsAndOperator(_lastFillCsOperands);
+        if (_lastFillColorOperands is not null)
+        {
+            WriteOperandsAndOperator(_lastFillColorOperands);
+        }
+        else if (_lastFillCsOperands is null)
+        {
+            _outStream.WriteString("0 g\n");
         }
         if (!_insideTextObject) _outCanvas.EndText();
     }

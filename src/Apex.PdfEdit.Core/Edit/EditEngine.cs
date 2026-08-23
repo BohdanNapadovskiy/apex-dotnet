@@ -115,6 +115,10 @@ public sealed class EditEngine
         var plan = EditPlan.NewBuilder();
         var applied = new List<string>();
         var issues = new List<EditIssue>();
+        // nodeId -> (page, ORIGINAL bbox, cumulative dy) across every push-down op — the
+        // writer pairs untagged decorations with their owner and moves them by exactly
+        // the owner's total dy (band composition overshot when op chains differed).
+        var decor = new Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)>();
 
         foreach (var op in edits.Operations)
         {
@@ -126,10 +130,10 @@ public sealed class EditEngine
                         ApplySetText(s, byId, alignmentByNode, geom, nodesByPage, plan);
                         break;
                     case AddParagraphOp a:
-                        ApplyAddParagraph(a, doc, geom, byId, BuildChildrenByParent(doc), plan);
+                        ApplyAddParagraph(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor);
                         break;
                     case AddListItemOp a:
-                        ApplyAddListItem(a, doc, geom, byId, BuildChildrenByParent(doc), plan);
+                        ApplyAddListItem(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor);
                         break;
                     case DeleteNodeOp d:
                         ApplyDeleteNode(d, doc, byId, BuildChildrenByParent(doc), plan);
@@ -146,6 +150,11 @@ public sealed class EditEngine
                 // propagate so bugs aren't silently hidden as per-op warnings.
                 issues.Add(new EditIssue(op.Id, op.Type, e.Message));
             }
+        }
+
+        foreach (var d in decor.Values)
+        {
+            plan.DecorShift(new DecorShiftOverlay(d.Page, d.X, d.Y, d.W, d.H, d.Dy));
         }
 
         return new EditResult(plan.Build(), applied, issues);
@@ -224,7 +233,70 @@ public sealed class EditEngine
             target.Mcid,
             glyphBaselineY,
             nextSiblingTopY,
-            sourceRuns));
+            sourceRuns,
+            SourceLineGap(geom, target.Page, target.Mcid)));
+    }
+
+    /// <summary>
+    /// Observed baseline-to-baseline gap of the source block's glyph lines, or 0 when the
+    /// block is single-line or the gaps are irregular. Lets the writer re-wrap multi-line
+    /// replacements at the SOURCE spacing instead of the font's natural leading (PLATO p1:
+    /// a double-spaced worksheet paragraph collapsed into tight lines).
+    /// </summary>
+    private static double SourceLineGap(GeometryJson? geom, int page, int mcid)
+    {
+        if (geom is null) return 0;
+        var ys = new List<double>();
+        foreach (var g in geom.GlyphsFor(page, mcid))
+        {
+            bool seen = false;
+            foreach (var y in ys)
+            {
+                if (Math.Abs(y - g.Y) < 1.0) { seen = true; break; }
+            }
+            if (!seen) ys.Add(g.Y);
+        }
+        if (ys.Count < 2) return 0;
+        ys.Sort();
+        ys.Reverse();
+        double first = ys[0] - ys[1];
+        double sum = 0;
+        for (int i = 1; i < ys.Count; i++)
+        {
+            double gap = ys[i - 1] - ys[i];
+            if (gap <= 0 || Math.Abs(gap - first) > 1.5) return 0;
+            sum += gap;
+        }
+        return sum / (ys.Count - 1);
+    }
+
+    /// <summary>
+    /// Annotation-backed tree nodes (form-field widgets, links) draw via page /Annots, not
+    /// /Contents — a push-down must translate their annotation /Rect alongside the moved
+    /// text. Emitted per shifted node (pre-shift bbox) so only annotations whose content
+    /// actually moved follow; a band-wide sweep dragged unrelated TOC links (UDO p2).
+    /// </summary>
+    private static void AccumulateDecorShift(
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor,
+        int page, TreeNode n, double shiftAmount)
+    {
+        if (n.Id is null || !HasBbox(n) || !HasMcid(n)) return;
+        if (decor.TryGetValue(n.Id, out var d))
+        {
+            decor[n.Id] = d with { Dy = d.Dy - shiftAmount };
+        }
+        else
+        {
+            // First shift of this node - n.Y is still its ORIGINAL (source-stream) position.
+            decor[n.Id] = (page, n.X, n.Y, n.Width, n.Height, -shiftAmount);
+        }
+    }
+
+    private static void EmitAnnotShiftIfAnnotBacked(EditPlan.Builder plan, int page, TreeNode n, double shiftAmount)
+    {
+        if (!HasBbox(n)) return;
+        if (n.Text is not ("Form" or "Link" or "Annot" or "Widget")) return;
+        plan.AnnotShift(new AnnotShiftOverlay(page, n.X, n.Y, n.Width, n.Height, -shiftAmount));
     }
 
     private static double NextSiblingTopBelow(Dictionary<int, List<TreeNode>> nodesByPage, TreeNode target)
@@ -252,7 +324,8 @@ public sealed class EditEngine
     private void ApplyAddParagraph(AddParagraphOp op, DocumentJson doc, GeometryJson? geom,
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
-        EditPlan.Builder plan)
+        EditPlan.Builder plan,
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor)
     {
         if (string.IsNullOrWhiteSpace(op.Parent))
         {
@@ -375,7 +448,9 @@ public sealed class EditEngine
         var toShift = applyPushDown ? CollectShiftTargets(doc, childrenByParent, siblings, index, page) : new List<TreeNode>();
         toShift = ExcludeNodesAboveBand(toShift, y + height, geom, page);
         toShift = ExcludeNodesOutsideColumn(toShift, x, x + width, geom, page);
+        toShift = ExcludeSplitLists(toShift, byId, childrenByParent, y + height, null);
         toShift = PruneShiftChain(toShift, y, shiftAmount);
+        var keepOut = KeepOutRects(doc, page, toShift);
         foreach (var n in toShift)
         {
             if (HasBbox(n) && (n.Y - shiftAmount) < 0)
@@ -424,6 +499,8 @@ public sealed class EditEngine
 
         foreach (var n in toShift)
         {
+            EmitAnnotShiftIfAnnotBacked(plan, page, n, shiftAmount);
+            AccumulateDecorShift(decor, page, n, shiftAmount);
             if (HasBbox(n)) n.Y -= shiftAmount;
             if (HasMcid(n))
             {
@@ -439,14 +516,15 @@ public sealed class EditEngine
         if (toShift.Count > 0)
         {
             var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, x, x + width);
-            plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount, bandLeft, bandRight));
+            plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount, bandLeft, bandRight, keepOut));
         }
     }
 
     private void ApplyAddListItem(AddListItemOp op, DocumentJson doc, GeometryJson? geom,
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
-        EditPlan.Builder plan)
+        EditPlan.Builder plan,
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor)
     {
         if (string.IsNullOrWhiteSpace(op.Parent))
         {
@@ -612,7 +690,9 @@ public sealed class EditEngine
         double columnLeft = Math.Min(donorLbl.X, donorLBody.X);
         double columnRight = Math.Max(donorLbl.X + donorLbl.Width, donorLBody.X + donorLBody.Width);
         toShift = ExcludeNodesOutsideColumn(toShift, columnLeft, columnRight, geom, page);
+        toShift = ExcludeSplitLists(toShift, byId, childrenByParent, newY + height, listParent.Id);
         toShift = PruneShiftChain(toShift, newY, shiftAmount);
+        var keepOut = KeepOutRects(doc, page, toShift);
 
         foreach (var n in toShift)
         {
@@ -666,6 +746,8 @@ public sealed class EditEngine
 
         foreach (var n in toShift)
         {
+            EmitAnnotShiftIfAnnotBacked(plan, page, n, shiftAmount);
+            AccumulateDecorShift(decor, page, n, shiftAmount);
             if (HasBbox(n)) n.Y -= shiftAmount;
             if (HasMcid(n))
             {
@@ -679,8 +761,54 @@ public sealed class EditEngine
         if (toShift.Count > 0)
         {
             var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, columnLeft, columnRight);
-            plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount, bandLeft, bandRight));
+            plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount, bandLeft, bandRight, keepOut));
         }
+    }
+
+    /// <summary>
+    /// Bboxes of every LEAF node on the page whose text is NOT moving (not in the final
+    /// shift chain) — the path band must not sweep their decorations. Covers both nodes
+    /// the exclusion passes dropped AND nodes that precede the insertion in reading order
+    /// but sit below the band geometrically (UDO p2: left-column TOC link underlines).
+    /// </summary>
+    private static List<KeepOutRect> KeepOutRects(DocumentJson doc, int page, List<TreeNode> kept)
+    {
+        var keptIds = new HashSet<string>();
+        foreach (var n in kept)
+        {
+            if (n.Id is not null) keptIds.Add(n.Id);
+        }
+        var shiftedBoxes = new List<KeepOutRect>();
+        foreach (var n in kept)
+        {
+            if (HasBbox(n)) shiftedBoxes.Add(new KeepOutRect(n.X, n.Y, n.Width, n.Height));
+        }
+
+        var keepOut = new List<KeepOutRect>();
+        foreach (var n in doc.Tree)
+        {
+            if (n.Page != page || !HasBbox(n) || !HasMcid(n)) continue;
+            if (n.Id is not null && keptIds.Contains(n.Id)) continue;
+            // A non-shifted node riding INSIDE a shifted one (a Link inside a pushed-down P)
+            // must not veto the move — its decorations belong to the moving text
+            // (form-40x p2: a link underline stranded mid-paragraph as a strikethrough).
+            // FULL containment only: a mere centre overlap with a wide shifted paragraph
+            // dropped an unshifted heading's keep-out and its pill background moved alone.
+            const double slack = 2.0;
+            bool insideShifted = false;
+            foreach (var s in shiftedBoxes)
+            {
+                if (n.X >= s.X - slack && n.X + n.Width <= s.X + s.Width + slack
+                    && n.Y >= s.Y - slack && n.Y + n.Height <= s.Y + s.Height + slack)
+                {
+                    insideShifted = true;
+                    break;
+                }
+            }
+            if (insideShifted) continue;
+            keepOut.Add(new KeepOutRect(n.X, n.Y, n.Width, n.Height));
+        }
+        return keepOut;
     }
 
     private List<TreeNode> CollectShiftTargetsFromRoots(DocumentJson doc,
@@ -927,11 +1055,15 @@ public sealed class EditEngine
 
     private static bool HasMcid(TreeNode? n) => n is not null && n.Mcid >= 0;
 
+    // Sub-point overlaps are extraction noise, not visual collisions - a donor Lbl/LBody
+    // pair 0.25pt apart tripped the new-node check (ImplementationGuidelines p11).
+    private const double OverlapTolerancePt = 1.0;
+
     private static bool XOverlap(double x1, double w1, double x2, double w2)
-        => Math.Max(x1, x2) < Math.Min(x1 + w1, x2 + w2);
+        => Math.Max(x1, x2) < Math.Min(x1 + w1, x2 + w2) - OverlapTolerancePt;
 
     private static bool YOverlap(double y1, double h1, double y2, double h2)
-        => Math.Max(y1, y2) < Math.Min(y1 + h1, y2 + h2);
+        => Math.Max(y1, y2) < Math.Min(y1 + h1, y2 + h2) - OverlapTolerancePt;
 
     private readonly record struct Bbox(double X, double Y, double W, double H);
 
@@ -1186,6 +1318,80 @@ public sealed class EditEngine
     /// with no geometry at all are kept (no evidence to exclude on).
     /// </summary>
     private static List<TreeNode> ExcludeNodesOutsideColumn(List<TreeNode> toShift,
+        double columnLeft, double columnRight, GeometryJson? geom, int page)
+    {
+        return ExcludeNodesOutsideColumnCore(toShift, columnLeft, columnRight, geom, page);
+    }
+
+    /// <summary>
+    /// Drop shift candidates whose nearest L/List ancestor also has visible items that are
+    /// NOT shifting (typically excluded as above-band): shifting only the tail items tears
+    /// the list apart (form-40x p2: a left-column append split the mid-column bullet list —
+    /// "Give/Call" stayed while "Respond" moved down, leaving a gap and later collisions).
+    /// The op's own target list is exempt — mid-list inserts legitimately move later items.
+    /// </summary>
+    private static List<TreeNode> ExcludeSplitLists(List<TreeNode> toShift,
+        Dictionary<string, TreeNode> byId,
+        Dictionary<string, List<TreeNode>> childrenByParent,
+        double bandTopY, string? exemptListId)
+    {
+        if (toShift.Count == 0) return toShift;
+        var shiftIds = new HashSet<string>();
+        foreach (var n in toShift)
+        {
+            if (n.Id is not null) shiftIds.Add(n.Id);
+        }
+
+        string? NearestList(TreeNode n)
+        {
+            var cur = n;
+            while (cur.Parent is { } pid && byId.TryGetValue(pid, out var p))
+            {
+                if (p.Text is "L" or "List") return p.Id;
+                cur = p;
+            }
+            return null;
+        }
+
+        bool ListIsSplit(string listId)
+        {
+            var stack = new Stack<TreeNode>(ChildrenOf(childrenByParent, listId));
+            while (stack.Count > 0)
+            {
+                var c = stack.Pop();
+                bool visible = HasBbox(c) && HasMcid(c);
+                if (visible && (c.Id is null || !shiftIds.Contains(c.Id)))
+                {
+                    return true;
+                }
+                if (c.Id is not null)
+                {
+                    foreach (var g in ChildrenOf(childrenByParent, c.Id)) stack.Push(g);
+                }
+            }
+            return false;
+        }
+
+        var splitCache = new Dictionary<string, bool>();
+        var result = new List<TreeNode>();
+        foreach (var n in toShift)
+        {
+            var listId = NearestList(n);
+            if (listId is not null && !string.Equals(listId, exemptListId, StringComparison.Ordinal))
+            {
+                if (!splitCache.TryGetValue(listId, out bool split))
+                {
+                    split = ListIsSplit(listId);
+                    splitCache[listId] = split;
+                }
+                if (split) continue;
+            }
+            result.Add(n);
+        }
+        return result;
+    }
+
+    private static List<TreeNode> ExcludeNodesOutsideColumnCore(List<TreeNode> toShift,
         double columnLeft, double columnRight, GeometryJson? geom, int page)
     {
         // Column membership is TRANSITIVE: a wide paragraph overlapping the donor column
