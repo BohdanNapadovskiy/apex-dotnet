@@ -56,6 +56,7 @@ public sealed class FontAwareWriterTests
         {
             new FontAwareWriter(PageSize.LETTER, resolver).Write(doc, geom, fontAware);
         }
-        fontAware.Length.Should().BeGreaterThan(20_000);
+        // ToArray, not Length — iText's PdfWriter closes the underlying stream on Write.
+        fontAware.ToArray().Length.Should().BeGreaterThan(20_000);
     }
 }

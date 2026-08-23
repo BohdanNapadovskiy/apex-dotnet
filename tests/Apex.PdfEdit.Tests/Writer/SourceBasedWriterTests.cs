@@ -84,6 +84,7 @@ public sealed class SourceBasedWriterTests
         var srcPath = TestSamples.Resolve(Form40xPdf);
         var outBuf = new MemoryStream();
         new SourceBasedWriter(srcPath).Write(outBuf);
-        outBuf.Length.Should().BeGreaterThan(100_000L);
+        // ToArray, not Length — iText's PdfWriter closes the underlying stream on Write.
+        outBuf.ToArray().Length.Should().BeGreaterThan(100_000);
     }
 }
