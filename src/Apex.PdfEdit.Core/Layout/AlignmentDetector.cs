@@ -87,7 +87,25 @@ public sealed class AlignmentDetector
             .ToList();
         if (sameColumn.Count == 0) return Alignment.Left;
         var (modeLeft, modeRight) = PageEdges(sameColumn);
-        return Classify(donor, modeLeft, modeRight);
+        var a = Classify(donor, modeLeft, modeRight);
+        // A RIGHT verdict is ambiguous from the bbox alone: an indented sub-column (list
+        // LBody at x=85.5 under full-width paragraphs at x=36 — 2026 Proxy p3) also touches
+        // modeRight without matching modeLeft. If the donor's own left edge is a margin
+        // shared by other column nodes (its sibling LBodys), it is left-anchored, not
+        // right-aligned. Diverges from Java, which returns RIGHT here — see PORTING_PLAN §9.
+        if (a == Alignment.Right && SharesLeftEdge(donor, sameColumn)) return Alignment.Left;
+        return a;
+    }
+
+    private bool SharesLeftEdge(TreeNode donor, IReadOnlyList<TreeNode> column)
+    {
+        int matches = 0;
+        foreach (var n in column)
+        {
+            if (ReferenceEquals(n, donor)) continue;
+            if (Math.Abs(n.X - donor.X) <= _tolerance && ++matches >= 2) return true;
+        }
+        return false;
     }
 
     private Alignment Classify(TreeNode node, double modeLeft, double modeRight)
