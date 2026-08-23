@@ -373,6 +373,8 @@ public sealed class EditEngine
         }
 
         var toShift = applyPushDown ? CollectShiftTargets(doc, childrenByParent, siblings, index, page) : new List<TreeNode>();
+        toShift = ExcludeNodesAboveBand(toShift, y + height, geom, page);
+        toShift = ExcludeNodesOutsideColumn(toShift, x, x + width, geom, page);
         toShift = PruneShiftChain(toShift, y, shiftAmount);
         foreach (var n in toShift)
         {
@@ -431,7 +433,8 @@ public sealed class EditEngine
 
         ShiftOrphanGeometryMcids(doc, geom, page, y + height, toShift, shiftAmount, plan);
 
-        plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount));
+        var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, x, x + width);
+        plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount, bandLeft, bandRight));
     }
 
     private void ApplyAddListItem(AddListItemOp op, DocumentJson doc, GeometryJson? geom,
@@ -599,6 +602,10 @@ public sealed class EditEngine
                 }
             }
         }
+        toShift = ExcludeNodesAboveBand(toShift, newY + height, geom, page);
+        double columnLeft = Math.Min(donorLbl.X, donorLBody.X);
+        double columnRight = Math.Max(donorLbl.X + donorLbl.Width, donorLBody.X + donorLBody.Width);
+        toShift = ExcludeNodesOutsideColumn(toShift, columnLeft, columnRight, geom, page);
         toShift = PruneShiftChain(toShift, newY, shiftAmount);
 
         foreach (var n in toShift)
@@ -662,7 +669,8 @@ public sealed class EditEngine
 
         ShiftOrphanGeometryMcids(doc, geom, page, newY + height, toShift, shiftAmount, plan);
 
-        plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount));
+        var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, columnLeft, columnRight);
+        plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount, bandLeft, bandRight));
     }
 
     private List<TreeNode> CollectShiftTargetsFromRoots(DocumentJson doc,
@@ -1122,6 +1130,138 @@ public sealed class EditEngine
         return a == Alignment.Unknown ? Alignment.Left : a;
     }
 
+    /// <summary>
+    /// Drop shift candidates that sit ENTIRELY ABOVE the insertion band — the same
+    /// "y ≥ bandTopY → unchanged" rule <see cref="Writer.ContentStreamPathBandShifter"/>
+    /// applies to vector artwork. Reading-order collection sweeps in later-in-order
+    /// content that is physically above the insert in multi-column layouts (Bessemer p2:
+    /// appending a bullet in the left column collected the right column's table at the
+    /// page top), shifting text whose untouched backgrounds stay put. Diverges from
+    /// Java, which shifts every reading-order-later node — see PORTING_PLAN §9.
+    /// </summary>
+    private static List<TreeNode> ExcludeNodesAboveBand(List<TreeNode> toShift, double bandTopY,
+        GeometryJson? geom, int page)
+    {
+        var kept = new List<TreeNode>();
+        foreach (var n in toShift)
+        {
+            double? bottomY = null;
+            if (HasBbox(n))
+            {
+                bottomY = n.Y;
+            }
+            else if (HasMcid(n) && geom is not null)
+            {
+                // Bbox-less tree nodes (Bessemer TD cells carry y=0/h=0) — recover the
+                // bottom edge from geometry.json glyphs.
+                double minY = double.PositiveInfinity;
+                foreach (var g in geom.GlyphsFor(page, n.Mcid))
+                {
+                    if (g.Y < minY) minY = g.Y;
+                }
+                if (!double.IsPositiveInfinity(minY)) bottomY = minY;
+            }
+            if (bottomY is { } b && b >= bandTopY) continue;
+            kept.Add(n);
+        }
+        return kept;
+    }
+
+    /// <summary>
+    /// Drop shift candidates whose horizontal extent doesn't overlap the inserting
+    /// column. Reading-order collection sweeps in other columns' content (Bessemer p2:
+    /// a left-column bullet insert collected the right column's donut legend and
+    /// distributions table), which must stay put — their untouched backgrounds don't
+    /// move either. Bbox-less nodes fall back to geometry.json glyph extents; nodes
+    /// with no geometry at all are kept (no evidence to exclude on).
+    /// </summary>
+    private static List<TreeNode> ExcludeNodesOutsideColumn(List<TreeNode> toShift,
+        double columnLeft, double columnRight, GeometryJson? geom, int page)
+    {
+        // Column membership is TRANSITIVE: a wide paragraph overlapping the donor column
+        // (form-40x p2: a P spanning x 144-487 next to a 216-396 list) pulls its own
+        // horizontal neighbours into the shift — excluding them leaves interlocked rows
+        // half-shifted (collision). The span grows to a fixpoint; genuinely separate
+        // columns (Bessemer p2's right-hand donut/table) never overlap and stay out.
+        // Slack absorbs few-point overhangs past a column edge.
+        const double slack = 15.0;
+        var spans = new List<(TreeNode Node, double Left, double Right)?>();
+        foreach (var n in toShift)
+        {
+            double? left = null, right = null;
+            if (HasBbox(n))
+            {
+                left = n.X;
+                right = n.X + n.Width;
+            }
+            else if (HasMcid(n) && geom is not null)
+            {
+                double minX = double.PositiveInfinity, maxX = double.NegativeInfinity;
+                foreach (var g in geom.GlyphsFor(page, n.Mcid))
+                {
+                    if (g.X < minX) minX = g.X;
+                    if (g.X + g.Width > maxX) maxX = g.X + g.Width;
+                }
+                if (!double.IsPositiveInfinity(minX)) { left = minX; right = maxX; }
+            }
+            spans.Add(left is { } l && right is { } r ? (n, l, r) : null);
+        }
+
+        double spanLeft = columnLeft, spanRight = columnRight;
+        var inColumn = new bool[toShift.Count];
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (int i = 0; i < toShift.Count; i++)
+            {
+                if (inColumn[i] || spans[i] is not { } s) continue;
+                if (s.Right <= spanLeft - slack || s.Left >= spanRight + slack) continue;
+                inColumn[i] = true;
+                changed = true;
+                if (s.Left < spanLeft) spanLeft = s.Left;
+                if (s.Right > spanRight) spanRight = s.Right;
+            }
+        }
+
+        var kept = new List<TreeNode>();
+        for (int i = 0; i < toShift.Count; i++)
+        {
+            // No measurable extent → keep (no evidence to exclude on).
+            if (spans[i] is null || inColumn[i]) kept.Add(toShift[i]);
+        }
+        return kept;
+    }
+
+    /// <summary>
+    /// Horizontal span the push-down band applies to: union of the inserted item's span
+    /// and every surviving shift target's span, padded by a small slack so column-edge
+    /// artwork (bar-chart labels drawn a few points left of the text margin) rides along.
+    /// </summary>
+    private static (double Left, double Right) ComputeBandSpan(List<TreeNode> toShift,
+        GeometryJson? geom, int page, double itemLeft, double itemRight)
+    {
+        const double slack = 15.0;
+        double left = itemLeft, right = itemRight;
+        foreach (var n in toShift)
+        {
+            if (HasBbox(n))
+            {
+                left = Math.Min(left, n.X);
+                right = Math.Max(right, n.X + n.Width);
+            }
+            else if (HasMcid(n) && geom is not null)
+            {
+                foreach (var g in geom.GlyphsFor(page, n.Mcid))
+                {
+                    left = Math.Min(left, g.X);
+                    right = Math.Max(right, g.X + g.Width);
+                }
+            }
+        }
+        return (left - slack, right + slack);
+    }
+
     internal static List<TreeNode> PruneShiftChain(List<TreeNode> toShift, double newParaBottomY, double shiftAmount)
     {
         if (toShift.Count == 0) return toShift;
@@ -1131,7 +1271,12 @@ public sealed class EditEngine
             if (HasBbox(n) && HasMcid(n)) visual.Add(n);
         }
         if (visual.Count == 0) return toShift;
-        visual.Sort((a, b) => (-a.Y).CompareTo(-b.Y));
+        // Walk in TOP-edge order, not bottom-edge: a tall node (Bessemer p2's 230pt
+        // Figure, top 345 / bottom 114) sorted by bottom walks AFTER the small
+        // references nested inside it, so the walk saw a fake 254pt gap to the
+        // references' top and cut them out of the chain while keeping the Figure —
+        // the Figure then shifted onto the suddenly-static references.
+        visual.Sort((a, b) => (-(a.Y + a.Height)).CompareTo(-(b.Y + b.Height)));
 
         double prevBottom = newParaBottomY;
         double cutoffTopY = double.NegativeInfinity;
@@ -1144,7 +1289,11 @@ public sealed class EditEngine
                 cutoffTopY = candidateTop;
                 break;
             }
-            prevBottom = candidate.Y - shiftAmount;
+            // Track the MINIMUM shifted bottom, not the last candidate's: a short Lbl
+            // walked after its tall LBody sibling (949163 p1 nested list rows) would
+            // otherwise RAISE prevBottom and fake a gap to the next row, cutting it
+            // from the chain while the rows above still shift onto it.
+            prevBottom = Math.Min(prevBottom, candidate.Y - shiftAmount);
         }
         if (double.IsNegativeInfinity(cutoffTopY)) return toShift;
 

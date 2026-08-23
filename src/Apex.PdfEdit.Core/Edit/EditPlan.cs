@@ -215,14 +215,13 @@ public sealed record DeleteOverlay(
 }
 
 /// <summary>
-/// Untagged-graphics push-down band. Instructs the writer to translate every path-drawing
-/// op (currently: rectangles via <c>re</c>) on <see cref="Page"/> that isn't inside an
-/// MCID-bearing BDC/EMC block, using this rule:
-/// <list type="bullet">
-///   <item>rect entirely below <see cref="BandTopY"/> (i.e., y + h ≤ bandTopY) — translate y by dy;</item>
-///   <item>rect straddles bandTopY — grow the bottom by |dy| so the outer border keeps
-///         enclosing the shifted content;</item>
-///   <item>rect entirely above bandTopY — unchanged.</item>
-/// </list>
+/// Untagged-graphics push-down band. Instructs the writer to translate untagged vector
+/// paths and untagged text on <see cref="Page"/> that sit entirely below
+/// <see cref="BandTopY"/> (straddling single-rects grow their bottom; straddling
+/// multi-op paths pass through so closed artwork doesn't tear).
+/// <see cref="LeftX"/>/<see cref="RightX"/> scope the band to the inserting column —
+/// content in other columns (Bessemer p2's right-column donut and table next to a
+/// left-column bullet insert) must not move. Defaults cover the full page width.
 /// </summary>
-public sealed record PathBandOverlay(int Page, double BandTopY, double Dy);
+public sealed record PathBandOverlay(int Page, double BandTopY, double Dy,
+    double LeftX = double.NegativeInfinity, double RightX = double.PositiveInfinity);

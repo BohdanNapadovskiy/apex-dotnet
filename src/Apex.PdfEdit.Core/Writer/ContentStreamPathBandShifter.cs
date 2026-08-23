@@ -1,34 +1,43 @@
 using System.Globalization;
-using Apex.PdfEdit.Core.Edit;
 using iText.Kernel.Pdf;
 using iText.Kernel.Pdf.Canvas.Parser;
+using Apex.PdfEdit.Core.Edit;
 
 namespace Apex.PdfEdit.Core.Writer;
 
 /// <summary>
-/// Push-down pass for <b>untagged</b> vector graphics — specifically <c>re</c>
-/// (rectangle) operators that live outside any MCID-bearing <c>BDC/EMC</c> block.
-/// Sibling of <see cref="ContentStreamMcidMover"/>: the mover handles tagged MCID blocks;
-/// this class handles the leftover decorative artwork (page frames, section borders,
-/// dividers) that would otherwise stay put and clip the shifted content.
+/// Applies <see cref="PathBandOverlay"/> vertical shifts to untagged page content:
+/// vector paths (<c>re m l c v y</c>) and text shown outside any MCID-bearing
+/// <c>BDC/EMC</c> block (chart labels, artifacts). Sibling of
+/// <see cref="ContentStreamMcidMover"/>: the mover handles tagged MCID blocks;
+/// this class handles the leftover decorative artwork and untagged text that would
+/// otherwise stay put and detach from the shifted content.
 ///
-/// <b>Rule per rect vs. band top</b> (<see cref="PathBandOverlay.BandTopY"/>):
+/// <b>CTM-aware</b>: chart artwork is routinely drawn under accumulated <c>cm</c>
+/// translations (Bessemer p2 positions bar-chart labels via <c>Td</c> under a cm
+/// chain that nets back to identity), so raw operand coordinates are meaningless —
+/// the shifter tracks q/Q/cm and evaluates DEVICE-space positions. Shifts are only
+/// applied while the CTM is translation+scale (no rotation/skew) with positive
+/// scale; anything else passes through unchanged.
+///
+/// <b>Whole-path rule</b> (device-space bbox of the buffered path vs
+/// <see cref="PathBandOverlay.BandTopY"/>):
 /// <list type="bullet">
-///   <item><c>y + h ≤ bandTopY</c> (entirely below): translate — <c>y_new = y + dy</c>.</item>
-///   <item><c>y ≥ bandTopY</c>     (entirely above): unchanged.</item>
-///   <item>otherwise (straddling): grow bottom — <c>y_new = y + dy, h_new = h - dy</c>
-///       (recall <c>dy &lt; 0</c> for push-down, so <c>h</c> increases). Keeps the top
-///       edge pinned so an enclosing border still contains the pre-band content above
-///       plus the shifted content below.</item>
+///   <item>entirely below the band top: translate every construction op.</item>
+///   <item>entirely above: unchanged.</item>
+///   <item>straddling: single-<c>re</c> paths keep the legacy grow-bottom rule
+///       (top edge pinned so an enclosing border still contains both halves);
+///       multi-op paths pass through unchanged so closed artwork (donut charts)
+///       doesn't tear.</item>
 /// </list>
 ///
-/// <b>Skip conditions</b> — a <c>re</c> is passed through unchanged when the processor
-/// is inside at least one BDC that carries an inline <c>/MCID</c>. Untagged BMC blocks
-/// (<c>/Artifact BMC</c>, plain <c>/Foo BMC</c>) do NOT count as "tagged"; their content
-/// is shift-eligible.
+/// <b>Untagged text rule</b>: the first positioning op of each <c>BT</c>
+/// (an absolute <c>Tm</c>, or the first <c>Td</c>/<c>TD</c> which acts absolutely
+/// on the BT-reset identity matrix) is shifted when its device-space baseline is
+/// below the band top. Later relative <c>Td</c>s inherit the shift naturally.
+/// Text inside a tagged BDC is never touched — the mover owns it.
 ///
-/// <b>Scope caveat</b> — line/curve paths (<c>m/l/c/v/y</c>) and image draws
-/// (<c>Do</c> / inline <c>BI...EI</c>) are NOT handled by this first cut.
+/// <b>Scope caveat</b> — image draws (<c>Do</c> / inline <c>BI...EI</c>) are NOT handled.
 /// </summary>
 internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
 {
@@ -43,6 +52,41 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
     /// <summary>Output stream to write the rewritten content stream into.</summary>
     private PdfOutputStream _out = null!;
 
+    // ---- CTM tracking (a b c d e f) — row-vector convention, cm premultiplies. ----
+    private readonly Stack<Matrix2D> _ctmStack = new();
+    private Matrix2D _ctm = Matrix2D.Identity;
+
+    // ---- Path buffering ----
+    private readonly List<(string Op, List<PdfObject> Operands)> _pathBuffer = new();
+    private bool _inPath;
+
+    // ---- Text state ----
+    private bool _insideText;
+    private bool _firstTextPosDone;
+
+    private readonly record struct Matrix2D(double A, double B, double C, double D, double E, double F)
+    {
+        public static readonly Matrix2D Identity = new(1, 0, 0, 1, 0, 0);
+
+        public Matrix2D Premultiply(Matrix2D m) => new(
+            m.A * A + m.B * C,
+            m.A * B + m.B * D,
+            m.C * A + m.D * C,
+            m.C * B + m.D * D,
+            m.E * A + m.F * C + E,
+            m.E * B + m.F * D + F);
+
+        public (double X, double Y) Apply(double x, double y)
+            => (A * x + C * y + E, B * x + D * y + F);
+
+        /// <summary>
+        /// Translation and axis-aligned positive scale only. Epsilon-tolerant: producers
+        /// emit near-identity matrices like <c>0.999997 -0.000001 -0.000002 1 … cm</c>
+        /// (Bessemer) — an exact zero test would disable shifting for the whole page.
+        /// </summary>
+        public bool IsShiftSafe => Math.Abs(B) <= 1e-3 && Math.Abs(C) <= 1e-3 && A > 0 && D > 0;
+    }
+
     private ContentStreamPathBandShifter(IReadOnlyList<PathBandOverlay> bands)
         : base(new ContentStreamHelpers.NoOpListener())
     {
@@ -50,10 +94,9 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
     }
 
     /// <summary>
-    /// Rewrite <paramref name="page"/>'s content stream, applying the given band shifts to
-    /// every unshielded <c>re</c> op. Runs AFTER <see cref="ContentStreamMcidMover"/>
-    /// so shifts on tagged content are already committed to /Contents before we walk
-    /// the stream a second time.
+    /// Rewrite <paramref name="page"/>'s content stream, applying the given band shifts.
+    /// Runs AFTER <see cref="ContentStreamMcidMover"/> so shifts on tagged content are
+    /// already committed to /Contents before we walk the stream a second time.
     /// </summary>
     internal static void Apply(PdfPage page, IReadOnlyList<PathBandOverlay>? bands)
     {
@@ -76,53 +119,263 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
         proc.ProcessContent(originalBytes, resources);
     }
 
+    private static readonly HashSet<string> PathConstructionOps = new(StringComparer.Ordinal)
+    {
+        "m", "l", "c", "v", "y", "re", "h"
+    };
+
+    private static readonly HashSet<string> PathPaintingOps = new(StringComparer.Ordinal)
+    {
+        "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"
+    };
+
     protected override void InvokeOperator(PdfLiteral op, IList<PdfObject> operands)
     {
         var opName = op.ToString();
+
+        if (PathConstructionOps.Contains(opName))
+        {
+            _inPath = true;
+            _pathBuffer.Add((opName, new List<PdfObject>(operands)));
+            return;
+        }
+        if (_inPath && (opName == "W" || opName == "W*"))
+        {
+            // Clip modifier between construction and paint — keep with the path.
+            _pathBuffer.Add((opName, new List<PdfObject>(operands)));
+            return;
+        }
+        if (_inPath && PathPaintingOps.Contains(opName))
+        {
+            FlushPath(operands);
+            return;
+        }
+
         switch (opName)
         {
-            case "BDC":
+            case "q":
+                _ctmStack.Push(_ctm);
+                break;
+            case "Q":
+                if (_ctmStack.Count > 0) _ctm = _ctmStack.Pop();
+                break;
+            case "cm":
+                if (operands.Count >= 7)
                 {
-                    bool hasMcid = operands.Count >= 3 && HasInlineMcid(operands[1]);
-                    _mcStack.Push(hasMcid);
-                    WriteOperandsAndOperator(operands);
-                    return;
+                    _ctm = _ctm.Premultiply(new Matrix2D(
+                        NumOrZero(operands[0]), NumOrZero(operands[1]),
+                        NumOrZero(operands[2]), NumOrZero(operands[3]),
+                        NumOrZero(operands[4]), NumOrZero(operands[5])));
                 }
+                break;
+            case "BDC":
+                _mcStack.Push(operands.Count >= 3 && HasInlineMcid(operands[1]));
+                break;
             case "BMC":
                 // BMC never has an inline properties dict — always shift-eligible.
                 _mcStack.Push(false);
-                WriteOperandsAndOperator(operands);
-                return;
+                break;
             case "EMC":
                 if (_mcStack.Count > 0) _mcStack.Pop();
-                WriteOperandsAndOperator(operands);
-                return;
-            case "re":
+                break;
+            case "BT":
+                _insideText = true;
+                _firstTextPosDone = false;
+                break;
+            case "ET":
+                _insideText = false;
+                break;
+            case "Tm":
+                if (_insideText && !InsideTaggedMcid() && operands.Count >= 7 && _ctm.IsShiftSafe)
                 {
-                    if (operands.Count >= 4 && !InsideTaggedMcid())
-                    {
-                        double x = NumOrZero(operands[0]);
-                        double y = NumOrZero(operands[1]);
-                        double w = NumOrZero(operands[2]);
-                        double h = NumOrZero(operands[3]);
-                        var shifted = ApplyBands(x, y, w, h);
-                        // Only rewrite if a band actually changed (y, h). x/w never move.
-                        // Pass-through preserves iText's original number formatting when
-                        // the rect is above every band — makes the output diff smaller.
-                        if (shifted.Y != y || shifted.H != h)
-                        {
-                            _out.WriteString(
-                                Fmt(shifted.X) + " " + Fmt(shifted.Y) + " " +
-                                Fmt(shifted.W) + " " + Fmt(shifted.H) + " re\n");
-                            return;
-                        }
-                    }
-                    WriteOperandsAndOperator(operands);
+                    WriteShiftedTextPos(operands, xIdx: 4, yIdx: 5, opName);
+                    _firstTextPosDone = true;
                     return;
                 }
-            default:
-                WriteOperandsAndOperator(operands);
-                return;
+                _firstTextPosDone = true;
+                break;
+            case "Td":
+            case "TD":
+                if (_insideText && !_firstTextPosDone)
+                {
+                    _firstTextPosDone = true;
+                    // First Td after BT acts on the BT-reset identity matrix — absolute.
+                    if (!InsideTaggedMcid() && operands.Count >= 3 && _ctm.IsShiftSafe)
+                    {
+                        WriteShiftedTextPos(operands, xIdx: 0, yIdx: 1, opName);
+                        return;
+                    }
+                }
+                break;
+        }
+        WriteOperandsAndOperator(operands);
+    }
+
+    /// <summary>
+    /// Emit a Tm/Td/TD with its y operand shifted when the device-space position falls
+    /// below a band top. Non-number operands pass through unchanged.
+    /// </summary>
+    private void WriteShiftedTextPos(IList<PdfObject> operands, int xIdx, int yIdx, string opName)
+    {
+        double lx = NumOrZero(operands[xIdx]);
+        double ly = NumOrZero(operands[yIdx]);
+        var (devX, devY) = _ctm.Apply(lx, ly);
+        double devDy = ComposePointShift(devX, devY);
+        // Never push untagged text off the page bottom (footers, page numbers).
+        if (devDy == 0 || devY + devDy < 0)
+        {
+            WriteOperandsAndOperator(operands);
+            return;
+        }
+        var rewritten = new List<PdfObject>(operands);
+        rewritten[yIdx] = new PdfNumber(ly + devDy / _ctm.D);
+        WriteOperandsAndOperator(rewritten);
+    }
+
+    /// <summary>
+    /// Compose all bands' point rule: device y below a band top (and device x within
+    /// the band's column span) picks up its dy.
+    /// </summary>
+    private double ComposePointShift(double devX, double devY)
+    {
+        double total = 0;
+        double cur = devY;
+        foreach (var band in _bands)
+        {
+            if (devX < band.LeftX || devX > band.RightX) continue;
+            if (cur < band.BandTopY)
+            {
+                total += band.Dy;
+                cur += band.Dy;
+            }
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// Decide and emit the buffered path followed by its painting op.
+    /// </summary>
+    private void FlushPath(IList<PdfObject> paintOperands)
+    {
+        _inPath = false;
+        var buffered = _pathBuffer;
+        try
+        {
+            if (!InsideTaggedMcid() && _ctm.IsShiftSafe && TryComputeDeviceBbox(buffered, out var bbox))
+            {
+                bool singleRe = buffered.Count == 1 && buffered[0].Op == "re";
+                double devDy = 0, growDevH = 0;
+                double curBottom = bbox.MinY, curTop = bbox.MaxY;
+                foreach (var band in _bands)
+                {
+                    if (bbox.MaxX < band.LeftX || bbox.MinX > band.RightX) continue; // other column
+                    if (curBottom >= band.BandTopY) continue;      // entirely above — unchanged
+                    if (curTop <= band.BandTopY)                    // entirely below — translate
+                    {
+                        devDy += band.Dy;
+                        curBottom += band.Dy;
+                        curTop += band.Dy;
+                    }
+                    else if (singleRe)                              // straddles — grow bottom
+                    {
+                        devDy += band.Dy;
+                        growDevH -= band.Dy;
+                        curBottom += band.Dy;
+                    }
+                    // multi-op straddling paths: unchanged (closed artwork must not tear)
+                }
+                if (devDy != 0 || growDevH != 0)
+                {
+                    EmitShiftedPath(buffered, devDy / _ctm.D, growDevH / _ctm.D);
+                    WriteOperandsAndOperator(paintOperands);
+                    return;
+                }
+            }
+            foreach (var (_, ops) in buffered) WriteOperandsAndOperator(ops);
+            WriteOperandsAndOperator(paintOperands);
+        }
+        finally
+        {
+            _pathBuffer.Clear();
+        }
+    }
+
+    /// <summary>Device-space bbox over every coordinate pair in the buffered path.</summary>
+    private bool TryComputeDeviceBbox(List<(string Op, List<PdfObject> Operands)> path,
+        out (double MinX, double MaxX, double MinY, double MaxY) bbox)
+    {
+        double minX = double.PositiveInfinity, maxX = double.NegativeInfinity;
+        double minY = double.PositiveInfinity, maxY = double.NegativeInfinity;
+        foreach (var (op, ops) in path)
+        {
+            switch (op)
+            {
+                case "m" or "l" when ops.Count >= 3:
+                    Acc(NumOrZero(ops[0]), NumOrZero(ops[1]));
+                    break;
+                case "c" when ops.Count >= 7:
+                    Acc(NumOrZero(ops[0]), NumOrZero(ops[1]));
+                    Acc(NumOrZero(ops[2]), NumOrZero(ops[3]));
+                    Acc(NumOrZero(ops[4]), NumOrZero(ops[5]));
+                    break;
+                case "v" or "y" when ops.Count >= 5:
+                    Acc(NumOrZero(ops[0]), NumOrZero(ops[1]));
+                    Acc(NumOrZero(ops[2]), NumOrZero(ops[3]));
+                    break;
+                case "re" when ops.Count >= 5:
+                    {
+                        double x = NumOrZero(ops[0]), y = NumOrZero(ops[1]);
+                        double w = NumOrZero(ops[2]), h = NumOrZero(ops[3]);
+                        Acc(x, y);
+                        Acc(x + w, y + h);
+                        break;
+                    }
+            }
+        }
+        bbox = (minX, maxX, minY, maxY);
+        return !double.IsPositiveInfinity(minY);
+
+        void Acc(double x, double y)
+        {
+            var (devX, devY) = _ctm.Apply(x, y);
+            if (devX < minX) minX = devX;
+            if (devX > maxX) maxX = devX;
+            if (devY < minY) minY = devY;
+            if (devY > maxY) maxY = devY;
+        }
+    }
+
+    /// <summary>Re-emit the buffered path with every y coordinate moved by <paramref name="localDy"/>.</summary>
+    private void EmitShiftedPath(List<(string Op, List<PdfObject> Operands)> path,
+        double localDy, double localGrowH)
+    {
+        foreach (var (op, ops) in path)
+        {
+            switch (op)
+            {
+                case "m" or "l" when ops.Count >= 3:
+                    _out.WriteString(Fmt(NumOrZero(ops[0])) + " " + Fmt(NumOrZero(ops[1]) + localDy) + " " + op + "\n");
+                    break;
+                case "c" when ops.Count >= 7:
+                    _out.WriteString(
+                        Fmt(NumOrZero(ops[0])) + " " + Fmt(NumOrZero(ops[1]) + localDy) + " " +
+                        Fmt(NumOrZero(ops[2])) + " " + Fmt(NumOrZero(ops[3]) + localDy) + " " +
+                        Fmt(NumOrZero(ops[4])) + " " + Fmt(NumOrZero(ops[5]) + localDy) + " c\n");
+                    break;
+                case "v" or "y" when ops.Count >= 5:
+                    _out.WriteString(
+                        Fmt(NumOrZero(ops[0])) + " " + Fmt(NumOrZero(ops[1]) + localDy) + " " +
+                        Fmt(NumOrZero(ops[2])) + " " + Fmt(NumOrZero(ops[3]) + localDy) + " " + op + "\n");
+                    break;
+                case "re" when ops.Count >= 5:
+                    _out.WriteString(
+                        Fmt(NumOrZero(ops[0])) + " " + Fmt(NumOrZero(ops[1]) + localDy) + " " +
+                        Fmt(NumOrZero(ops[2])) + " " + Fmt(NumOrZero(ops[3]) + localGrowH) + " re\n");
+                    break;
+                default:
+                    WriteOperandsAndOperator(ops);
+                    break;
+            }
         }
     }
 
@@ -130,30 +383,6 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
     {
         foreach (var b in _mcStack) if (b) return true;
         return false;
-    }
-
-    /// <summary>
-    /// Apply every band's per-rect rule in order. Returns (x, y, w, h) after all
-    /// applicable bands. Multiple bands on the same page compose.
-    /// </summary>
-    private (double X, double Y, double W, double H) ApplyBands(double x, double y, double w, double h)
-    {
-        double curY = y, curH = h;
-        foreach (var band in _bands)
-        {
-            double top = curY + curH;
-            if (curY >= band.BandTopY) continue;         // entirely above — unchanged
-            if (top <= band.BandTopY)                     // entirely below — shift
-            {
-                curY += band.Dy;
-            }
-            else                                          // straddles — grow bottom
-            {
-                curY += band.Dy;
-                curH -= band.Dy;
-            }
-        }
-        return (x, curY, w, curH);
     }
 
     private void WriteOperandsAndOperator(IList<PdfObject> operands)
