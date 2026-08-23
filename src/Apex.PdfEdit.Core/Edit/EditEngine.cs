@@ -119,6 +119,11 @@ public sealed class EditEngine
         // writer pairs untagged decorations with their owner and moves them by exactly
         // the owner's total dy (band composition overshot when op chains differed).
         var decor = new Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)>();
+        // Deleted nodes leave their visual space EMPTY ("no pull-up") but still occupied —
+        // the box border/rule artifacts stay behind. Later adds must not land there
+        // (2026 Proxy p4: a paragraph appended after a delete sat on the deleted
+        // call-out box's border).
+        var tombstones = new List<(string Parent, int Page, double Y)>();
 
         foreach (var op in edits.Operations)
         {
@@ -130,13 +135,13 @@ public sealed class EditEngine
                         ApplySetText(s, byId, alignmentByNode, geom, nodesByPage, plan);
                         break;
                     case AddParagraphOp a:
-                        ApplyAddParagraph(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor);
+                        ApplyAddParagraph(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor, tombstones);
                         break;
                     case AddListItemOp a:
-                        ApplyAddListItem(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor);
+                        ApplyAddListItem(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor, tombstones);
                         break;
                     case DeleteNodeOp d:
-                        ApplyDeleteNode(d, doc, byId, BuildChildrenByParent(doc), plan);
+                        ApplyDeleteNode(d, doc, byId, BuildChildrenByParent(doc), plan, tombstones);
                         break;
                     default:
                         throw new InvalidOperationException("Unknown op type: " + op.GetType().Name);
@@ -325,7 +330,8 @@ public sealed class EditEngine
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
         EditPlan.Builder plan,
-        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor)
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor,
+        List<(string Parent, int Page, double Y)> tombstones)
     {
         if (string.IsNullOrWhiteSpace(op.Parent))
         {
@@ -438,6 +444,15 @@ public sealed class EditEngine
             y = positionDonor.Y - paraGap - height;
             applyPushDown = false;
         }
+        // Vacated space from earlier deletes under the same parent stays reserved
+        // ("no pull-up") - its border/rule artifacts are still drawn there.
+        foreach (var t in tombstones)
+        {
+            if (string.Equals(t.Parent, op.Parent, StringComparison.Ordinal) && t.Page == page)
+            {
+                y = Math.Min(y, t.Y - paraGap - height);
+            }
+        }
         if (y < 0)
         {
             throw new ArgumentException(
@@ -524,7 +539,8 @@ public sealed class EditEngine
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
         EditPlan.Builder plan,
-        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor)
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor,
+        List<(string Parent, int Page, double Y)> tombstones)
     {
         if (string.IsNullOrWhiteSpace(op.Parent))
         {
@@ -647,6 +663,13 @@ public sealed class EditEngine
             }
             newY = prevBottom - listItemGap - height;
             applyPushDown = index < liSiblings.Count;
+        }
+        foreach (var t in tombstones)
+        {
+            if (string.Equals(t.Parent, op.Parent, StringComparison.Ordinal) && t.Page == page)
+            {
+                newY = Math.Min(newY, t.Y - listItemGap - height);
+            }
         }
         if (newY < 0)
         {
@@ -900,7 +923,8 @@ public sealed class EditEngine
     private void ApplyDeleteNode(DeleteNodeOp op, DocumentJson doc,
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
-        EditPlan.Builder plan)
+        EditPlan.Builder plan,
+        List<(string Parent, int Page, double Y)> tombstones)
     {
         if (string.IsNullOrWhiteSpace(op.Target))
         {
@@ -943,6 +967,10 @@ public sealed class EditEngine
 
         plan.Delete(new DeleteOverlay(target.Page, target.Mcid, op.Target,
             target.X, target.Y, target.Width, target.Height));
+        if (target.Parent is { } tp && HasBbox(target))
+        {
+            tombstones.Add((tp, target.Page, target.Y));
+        }
         doc.Tree.Remove(target);
         byId.Remove(op.Target);
     }
