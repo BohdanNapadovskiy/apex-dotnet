@@ -39,13 +39,6 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
     private readonly Dictionary<string, IList<PdfObject>> _preservedStateOps = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Net q/Q balance seen inside the currently-active deleted block. Positive means
-    /// more q than Q (we owe compensating Q's after the block); negative means more
-    /// Q than q (we owe compensating Q's to keep the stack balanced).
-    /// </summary>
-    private int _qBalanceInsideBlock;
-
-    /// <summary>
     /// Cumulative text-matrix offset (Td/TD/T*) applied inside the currently-active
     /// deleted block. Replayed after EMC as a single <c>dx dy Td</c> so downstream MCIDs
     /// sharing the outer BT/ET see the same text matrix they would have without the delete.
@@ -138,7 +131,6 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
                 // Enter skip mode — drop BDC, everything inside, and the closing EMC.
                 _activeTargetMcid = mcid;
                 _preservedStateOps.Clear();
-                _qBalanceInsideBlock = 0;
                 _dxInsideBlock = 0;
                 _dyInsideBlock = 0;
                 _tmInsideBlock = false;
@@ -154,8 +146,8 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
         {
             // End of the block we're skipping — emit preserved text-state ops so downstream
             // MCIDs that inherit state (font, render mode, spacing) still work. Then replay
-            // the block's cumulative text-matrix offset and emit compensating q/Q so the
-            // graphics-state stack balance is preserved.
+            // the block's cumulative text-matrix offset. q/Q/cm/gs were already emitted
+            // in place (see below), so no stack compensation is needed here.
             int deletedMcid = _activeTargetMcid;
             _activeTargetMcid = -1;
             foreach (var stateOp in _preservedStateOps.Values)
@@ -164,15 +156,6 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
             }
             _preservedStateOps.Clear();
             EmitTextMatrixCompensation(deletedMcid);
-            if (_qBalanceInsideBlock > 0)
-            {
-                for (int i = 0; i < _qBalanceInsideBlock; i++) WriteOperatorLiteral("q");
-            }
-            else if (_qBalanceInsideBlock < 0)
-            {
-                for (int i = 0; i < -_qBalanceInsideBlock; i++) WriteOperatorLiteral("Q");
-            }
-            _qBalanceInsideBlock = 0;
             return;
         }
         if (_activeTargetMcid >= 0)
@@ -182,8 +165,19 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
             {
                 _preservedStateOps[opName] = new List<PdfObject>(operands);
             }
-            if ("q".Equals(opName, StringComparison.Ordinal)) _qBalanceInsideBlock++;
-            else if ("Q".Equals(opName, StringComparison.Ordinal)) _qBalanceInsideBlock--;
+            // Graphics-state ops pass through VERBATIM. A net q/Q count is not enough:
+            // a "Q … q" pair inside the block is net-zero but the Q restores a state the
+            // re-pushed q cannot recreate (Bessemer p1: the deleted H1 carried the Q that
+            // popped a preceding artifact's cm — dropping it left the date's block under
+            // a stale CTM, shifted by (195, -298)). Diverges from Java, which emits
+            // net-balance compensation — see PORTING_PLAN §9.
+            if ("q".Equals(opName, StringComparison.Ordinal)
+                || "Q".Equals(opName, StringComparison.Ordinal)
+                || "cm".Equals(opName, StringComparison.Ordinal)
+                || "gs".Equals(opName, StringComparison.Ordinal))
+            {
+                WriteOperandsAndOperator(operands);
+            }
             else if ("BT".Equals(opName, StringComparison.Ordinal))
             {
                 _btDepth++;
@@ -327,16 +321,6 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
             if (i > 0) _out.WriteSpace();
             _out.Write(operands[i]);
         }
-        _out.WriteNewLine();
-    }
-
-    /// <summary>
-    /// Emit a bare operator (no operands) — used to write compensating q/Q after a
-    /// deleted block whose q/Q count didn't balance.
-    /// </summary>
-    private void WriteOperatorLiteral(string opName)
-    {
-        _out.WriteBytes(Encoding.ASCII.GetBytes(opName));
         _out.WriteNewLine();
     }
 
