@@ -35,7 +35,7 @@ public sealed class OcrRevectorizeWriterTests
         }
 
         var bytes = outBuf.ToArray();
-        var debug = Path.Combine(TestOutputs.ForSample(Sample), Sample + "_ocr-revectorize.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(Sample), Sample + "_ocr-revectorize.pdf");
         File.WriteAllBytes(debug, bytes);
 
         using var reader = new PdfReader(new MemoryStream(bytes));
@@ -67,7 +67,7 @@ public sealed class OcrRevectorizeWriterTests
         }
 
         var bytes = outBuf.ToArray();
-        var debug = Path.Combine(TestOutputs.ForSample(Sample), Sample + "_ocr-edited.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(Sample), Sample + "_ocr-edited.pdf");
         File.WriteAllBytes(debug, bytes);
 
         result.Issues.Should().BeEmpty("edit issues");

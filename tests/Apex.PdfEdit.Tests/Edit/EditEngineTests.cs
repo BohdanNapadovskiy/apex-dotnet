@@ -1048,7 +1048,7 @@ public sealed class EditEngineTests
             new SourceBasedWriter(pdfPath).Write(result.Plan, outBuf);
         }
 
-        var debug = Path.Combine(TestOutputs.ForSample(SampleDir), SampleDir + "_edit.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(SampleDir), SampleDir + "_edit.pdf");
         File.WriteAllBytes(debug, outBuf.ToArray());
 
         using var reader = new PdfReader(new MemoryStream(outBuf.ToArray()));
@@ -1092,7 +1092,7 @@ public sealed class EditEngineTests
             new SourceBasedWriter(pdfPath).Write(result.Plan, outBuf);
         }
 
-        var debug = Path.Combine(TestOutputs.ForSample(SampleDir), SampleDir + "_add.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(SampleDir), SampleDir + "_add.pdf");
         File.WriteAllBytes(debug, outBuf.ToArray());
 
         using var reader = new PdfReader(new MemoryStream(outBuf.ToArray()));
@@ -1132,7 +1132,7 @@ public sealed class EditEngineTests
             new SourceBasedWriter(pdfPath).Write(result.Plan, outBuf);
         }
 
-        var debug = Path.Combine(TestOutputs.ForSample(SampleDir), SampleDir + "_delete.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(SampleDir), SampleDir + "_delete.pdf");
         File.WriteAllBytes(debug, outBuf.ToArray());
 
         using var reader = new PdfReader(new MemoryStream(outBuf.ToArray()));
