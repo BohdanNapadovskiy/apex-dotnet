@@ -50,6 +50,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     private readonly IReadOnlyDictionary<int, SetTextOverlay> _byMcid;
     private readonly WriterFontCache? _fontCache;
 
+    private PdfPage _currentPage = null!;
     private PdfCanvas _outCanvas = null!;
     private PdfOutputStream _outStream = null!;
     private PageFontInventory? _pageFontInventory;
@@ -145,6 +146,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         var proc = new ContentStreamMcidReplacer(byMcid, fontCache, logger)
         {
+            _currentPage = page,
             _outCanvas = new PdfCanvas(freshContent, resources, page.GetDocument()),
             _outStream = freshContent.GetOutputStream(),
             _pageFontInventory = PageFontInventory.Of(page),
@@ -522,12 +524,32 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         {
             EmitFillColorRaw(color);
             _outCanvas.SetFontAndSize(font, fontSize).SetLeading(lineHeight);
+            // Per-char font split: chars the resolved font covers render there; chars it
+            // lacks fall through to the pool + universal fallback (2026-09-04 customer P2).
+            // Without this, a single-line replacement whose text contains a code point
+            // absent from `font`'s embedded subset silently emitted .notdef.
+            var pool = _pageFontInventory is not null && !string.IsNullOrWhiteSpace(style?.Family)
+                ? _pageFontInventory.CandidatesByFamilyAndWeight(style!.Family, style.Weight)
+                : (IReadOnlyList<PdfFont>)Array.Empty<PdfFont>();
+            var universalFallback = (_fontCache is not null
+                ? _fontCache.LoadUniversalFallback(style)
+                : SystemFontLocator.LoadUniversalFallback(style))
+                ?? font;
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
                 float lineX = AlignedX(overlay, font, fontSize, line);
                 float lineY = baselineY - i * lineHeight;
-                _outCanvas.SetTextMatrix(lineX, lineY).ShowText(line);
+                _outCanvas.SetTextMatrix(lineX, lineY);
+                if (_pageFontInventory is not null)
+                {
+                    MultiFontLineEmitter.EmitLine(_outCanvas, line, font, pool,
+                        universalFallback, fontSize, _pageFontInventory, _currentPage);
+                }
+                else
+                {
+                    _outCanvas.ShowText(line);
+                }
             }
         }
 

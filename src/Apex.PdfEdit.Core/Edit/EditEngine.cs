@@ -196,22 +196,7 @@ public sealed class EditEngine
             throw new ArgumentException($"target id={op.Target} has zero bbox; cannot stamp overlay");
         }
 
-        if (_fontResolver is not null)
-        {
-            var missing = _allowExtractedGlyphs
-                ? _fontResolver.FirstUnrenderableCodePointForOcrRaster(target.Page, target.Mcid, op.NewContent)
-                : _fontResolver.FirstUnrenderableCodePoint(target.Page, target.Mcid, op.NewContent);
-            if (missing is { } cp)
-            {
-                throw new ArgumentException(
-                    $"setText.newContent for target id={op.Target}" +
-                    $" needs character U+{cp.ToString("X4", CultureInfo.InvariantCulture)}" +
-                    $" ('{char.ConvertFromUtf32(cp)}'), which is not in the source PDF's embedded font subset for " +
-                    $"(page={target.Page}, mcid={target.Mcid}). " +
-                    "Restrict the edit to characters already used in the source, or extend " +
-                    "the source PDF's embedded font before re-running.");
-            }
-        }
+        CheckFontCoverage("setText.newContent", $"target id={op.Target}", target.Page, target.Mcid, op.NewContent);
 
         CheckPage(op.Page, target.Page, "setText", $"target id={target.Id}");
 
@@ -415,6 +400,11 @@ public sealed class EditEngine
 
         var styleDonor = explicitDonor ?? tagTreeDonor ?? positionDonor;
         var style = ResolveStyle(styleDonor.Page, styleDonor.Mcid, op.Style?.Font);
+
+        // Font-subset pre-flight against the donor that ResolveStyle actually used —
+        // structural donors with mcid<0 are skipped (no font known), matching setText.
+        CheckFontCoverage("addParagraph.content", $"style donor id={styleDonor.Id}",
+            styleDonor.Page, styleDonor.Mcid, op.Content);
 
         int page = positionDonor.Page;
         CheckPage(op.Page, page, "addParagraph", $"position donor id={positionDonor.Id}");
@@ -627,6 +617,18 @@ public sealed class EditEngine
             throw new ArgumentException(
                 $"addListItem donor LI id={donorLi.Id} has no MCID-bearing descendant — writer can't locate the L container.");
         }
+
+        // Fall back to donorMcidLeaf when the specific column donor lacks its own MCID
+        // (e.g. structural Lbl with a leaf descendant carrying the mcid). Matches the
+        // font the writer will pick in AddListItemStamper.ResolveFontFor.
+        int lblFontMcid = HasMcid(donorLbl) ? donorLbl.Mcid : donorMcidLeaf.Mcid;
+        int lblFontPage = HasMcid(donorLbl) ? donorLbl.Page : donorMcidLeaf.Page;
+        int bodyFontMcid = HasMcid(donorLBody) ? donorLBody.Mcid : donorMcidLeaf.Mcid;
+        int bodyFontPage = HasMcid(donorLBody) ? donorLBody.Page : donorMcidLeaf.Page;
+        CheckFontCoverage("addListItem.labelText", $"donor Lbl id={donorLbl.Id}",
+            lblFontPage, lblFontMcid, op.LabelText);
+        CheckFontCoverage("addListItem.bodyText", $"donor LBody id={donorLBody.Id}",
+            bodyFontPage, bodyFontMcid, op.BodyText);
 
         var fontOverride = op.Style?.Font;
         var lblStyle = ResolveStyle(donorLbl.Page, donorLbl.Mcid, fontOverride);
@@ -1609,6 +1611,83 @@ public sealed class EditEngine
                 $"{opName}.page={p} does not match the resolved page {resolvedPage} (from {source})." +
                 " Remove the page field or correct it to match.");
         }
+    }
+
+    /// <summary>
+    /// Pre-flight guard shared by setText, addParagraph, and addListItem. Rejects
+    /// text ONLY when neither the source PDF's embedded font subset at (page, mcid)
+    /// NOR the writer's guaranteed-embedded system fallback (Arial-family via
+    /// <see cref="SystemFontLocator.LoadUniversalFallback"/>) can render some
+    /// character in <paramref name="text"/>.
+    ///
+    /// When the source subset misses a char but the fallback covers it, the writer's
+    /// per-char <see cref="MultiFontLineEmitter"/> picks the fallback for that char
+    /// — the op proceeds. A structured log line records the mixed-face rendering
+    /// so the operator can trace visual font swaps.
+    ///
+    /// History: P1 (2026-09-04) rejected any source-subset miss to stop the silent
+    /// drop the customer reported. P2 relaxes the reject once we know the writer
+    /// has a real fallback — accepting the customer's addListItem now works end
+    /// to end even for chars like 'X'/'Y'/brackets/braces that aren't in the source
+    /// subset for a typical prose LBody.
+    ///
+    /// No-op when the resolver is unset, the mcid is negative (no known font), or
+    /// the text is empty.
+    /// </summary>
+    private void CheckFontCoverage(string opField, string subjectLabel, int page, int mcid, string? text)
+    {
+        if (_fontResolver is null) return;
+        if (string.IsNullOrEmpty(text)) return;
+        if (mcid < 0) return;
+        var missing = _allowExtractedGlyphs
+            ? _fontResolver.FirstUnrenderableCodePointForOcrRaster(page, mcid, text)
+            : _fontResolver.FirstUnrenderableCodePoint(page, mcid, text);
+        if (missing is not { } cp) return;
+
+        var style = _fontResolver.Resolve(page, mcid);
+        var fallbackMiss = FirstFallbackMiss(style, text);
+        if (fallbackMiss is null)
+        {
+            _log.LogWarning(
+                "{OpField} for {Subject}: char U+{Cp:X4} ('{Char}') not in source subset " +
+                "(page={Page}, mcid={Mcid}); writer will emit via embedded system fallback (mixed-face rendering).",
+                opField, subjectLabel, cp, char.ConvertFromUtf32(cp), page, mcid);
+            return;
+        }
+        int hardMissCp = fallbackMiss.Value;
+        throw new ArgumentException(
+            $"{opField} for {subjectLabel}" +
+            $" needs character U+{hardMissCp.ToString("X4", CultureInfo.InvariantCulture)}" +
+            $" ('{char.ConvertFromUtf32(hardMissCp)}'), which neither the source PDF's embedded font subset for " +
+            $"(page={page}, mcid={mcid}) nor the writer's embedded system fallback can render. " +
+            "Restrict the edit to characters covered by an installed system font family, or extend " +
+            "the source PDF's embedded font before re-running.");
+    }
+
+    /// <summary>
+    /// First code point in <paramref name="text"/> that the writer's system fallback
+    /// (same face family the AddListItemStamper / AddParagraphStamper / ContentStreamMcidReplacer
+    /// pick when the source subset misses a char) can't render — or null when the
+    /// fallback covers everything. Loading the fallback is cheap (metadata-only read
+    /// of the on-disk TTF).
+    /// </summary>
+    private static int? FirstFallbackMiss(FontStyle? style, string text)
+    {
+        var fallback = SystemFontLocator.LoadUniversalFallback(style);
+        if (fallback is null)
+        {
+            // No system font present — treat every char as a hard miss so the pre-flight
+            // still fails loud rather than letting the writer land on non-embedded stdlib.
+            for (int i = 0; i < text.Length;)
+            {
+                int cp = char.ConvertToUtf32(text, i);
+                if (cp != '\n' && cp != '\r' && cp != '\t') return cp;
+                i += char.IsHighSurrogate(text[i]) ? 2 : 1;
+            }
+            return null;
+        }
+        int miss = PageFontInventory.FirstMissingCodePoint(fallback, text);
+        return miss >= 0 ? miss : null;
     }
 
     private FontStyle ResolveStyle(int page, int mcid)

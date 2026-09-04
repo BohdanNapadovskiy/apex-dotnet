@@ -71,24 +71,29 @@ internal static class AddListItemStamper
         // ---- 3. Emit the two tagged text blocks in one canvas pass --------------------
         // Resolve font / colour / size / leading INDEPENDENTLY per column — bullets often
         // differ from body text in size and colour.
-        var lblFont = ResolveFontFor(inv, overlay.LblStyle, overlay.LabelText, overlay.NewLiId, fontCache, log);
+        // Per-column primary/pool/fallback mirrors AddParagraphStamper: chars the source
+        // subset can render use the source-embedded twin; missing chars fall through to
+        // the embedded system fallback via MultiFontLineEmitter's per-char picker.
+        var lblFonts = ResolveColumnFonts(inv, doc, overlay.LblStyle, overlay.LabelText,
+            overlay.NewLiId, fontCache, log);
         var lblColor = StandardFontMapper.ParseHex(overlay.LblStyle.ColorHex);
         float lblFontSize = overlay.LblStyle.Size >= 4.0f ? overlay.LblStyle.Size : 10.0f;
         float lblLeadingMult = ContentStreamMcidReplacer.EffectiveLeadingMultiplier(overlay.LblStyle);
 
-        var bodyFont = ResolveFontFor(inv, overlay.BodyStyle, overlay.BodyText, overlay.NewLiId, fontCache, log);
+        var bodyFonts = ResolveColumnFonts(inv, doc, overlay.BodyStyle, overlay.BodyText,
+            overlay.NewLiId, fontCache, log);
         var bodyColor = StandardFontMapper.ParseHex(overlay.BodyStyle.ColorHex);
         float bodyFontSize = overlay.BodyStyle.Size >= 4.0f ? overlay.BodyStyle.Size : 10.0f;
         float bodyLeadingMult = ContentStreamMcidReplacer.EffectiveLeadingMultiplier(overlay.BodyStyle);
 
         var canvas = new PdfCanvas(page, true);
-        StampTextBlock(canvas, lblFont, lblColor, lblFontSize, lblLeadingMult,
+        StampTextBlock(canvas, page, inv, lblFonts, lblColor, lblFontSize, lblLeadingMult,
             new PdfName(StandardRoles.LBL), mcidLbl,
             overlay.LabelText,
             (float)overlay.LblX, (float)overlay.LblY,
             (float)overlay.LblWidth, (float)overlay.LblHeight,
             Alignment.Left); // labels always left-anchor
-        StampTextBlock(canvas, bodyFont, bodyColor, bodyFontSize, bodyLeadingMult,
+        StampTextBlock(canvas, page, inv, bodyFonts, bodyColor, bodyFontSize, bodyLeadingMult,
             new PdfName(StandardRoles.LBODY), mcidBody,
             overlay.BodyText,
             (float)overlay.BodyX, (float)overlay.BodyY,
@@ -120,8 +125,16 @@ internal static class AddListItemStamper
             overlay.NewLiId, pageNumber, mcidLbl, mcidBody);
     }
 
-    /// <summary>One BDC/EMC block: tagged marked-content wrapping a single text-object draw.</summary>
-    private static void StampTextBlock(PdfCanvas canvas, PdfFont font, Color color, float fontSize,
+    /// <summary>
+    /// One BDC/EMC block: tagged marked-content wrapping a single text-object draw.
+    /// When <see cref="ColumnFonts.WholeText"/> is non-null the block emits a single
+    /// <c>Tf</c> + one <c>Tj</c> per line — matching the source's typical single-face
+    /// render. When null, <see cref="MultiFontLineEmitter"/> issues one <c>Tf</c>+<c>Tj</c>
+    /// pair per contiguous same-font run within the line so chars missing from the
+    /// preferred face fall through to the embedded fallback instead of dropping.
+    /// </summary>
+    private static void StampTextBlock(PdfCanvas canvas, PdfPage page, PageFontInventory inv,
+        ColumnFonts fonts, Color color, float fontSize,
         float leadingMult, PdfName role, int mcid, string text,
         float x, float y, float width, float height,
         Alignment alignment)
@@ -129,7 +142,8 @@ internal static class AddListItemStamper
         var props = new PdfDictionary();
         props.Put(PdfName.MCID, new PdfNumber(mcid));
 
-        var lines = ContentStreamMcidReplacer.WrapText(text, font, fontSize, width);
+        var displayFont = fonts.DisplayFont;
+        var lines = ContentStreamMcidReplacer.WrapText(text, displayFont, fontSize, width);
         float lineHeight = fontSize * leadingMult;
         float emittedLineHeight = lineHeight * AdobeTlCompensation;
         // Anchor the FIRST baseline near the TOP of the reserved bbox — the engine
@@ -144,14 +158,23 @@ internal static class AddListItemStamper
             .BeginMarkedContent(role, props)
             .SetFillColor(color)
             .BeginText()
-            .SetFontAndSize(font, fontSize)
+            .SetFontAndSize(displayFont, fontSize)
             .SetLeading(emittedLineHeight);
         for (int i = 0; i < lines.Count; i++)
         {
             var line = lines[i];
-            float lineX = AlignedX(x, width, font, fontSize, line, alignment);
+            float lineX = AlignedX(x, width, displayFont, fontSize, line, alignment);
             float lineY = baselineY - i * emittedLineHeight;
-            canvas.SetTextMatrix(lineX, lineY).ShowText(line);
+            canvas.SetTextMatrix(lineX, lineY);
+            if (fonts.WholeText is not null)
+            {
+                canvas.ShowText(line);
+            }
+            else
+            {
+                MultiFontLineEmitter.EmitLine(canvas, line, fonts.Primary, fonts.Pool,
+                    fonts.Fallback, fontSize, inv, page);
+            }
         }
         canvas.EndText().EndMarkedContent().RestoreState();
     }
@@ -223,48 +246,94 @@ internal static class AddListItemStamper
     }
 
     /// <summary>
-    /// Font resolution — tries the source PDF's own embedded subset first, then system,
-    /// then universal fallback, then standard-14. Embedded-first is critical for symbol/
-    /// dingbat labels: source bullets are commonly Wingdings/Symbol glyphs at PUA
-    /// codepoints that no system Latin font can render, but the source PDF's own subset
-    /// has the exact glyph.
+    /// Bundle of resolved fonts for a single column. When <see cref="WholeText"/> is
+    /// non-null, every char in the column's text can be rendered by that single font
+    /// — the emitter uses it exclusively (Adobe's Edit-PDF paragraph detection treats
+    /// a mid-string Tf switch as a paragraph boundary, so single-font is preferred
+    /// when possible). Otherwise the emitter walks the (primary, pool, fallback) chain
+    /// per character via <see cref="MultiFontLineEmitter"/>.
     /// </summary>
-    private static PdfFont ResolveFontFor(PageFontInventory inv, FontStyle style, string text,
-        string newLiId, WriterFontCache? fontCache, ILogger log)
+    private readonly record struct ColumnFonts(
+        PdfFont? Primary,
+        IReadOnlyList<PdfFont> Pool,
+        PdfFont Fallback,
+        PdfFont? WholeText)
     {
-        // Tier 1: exact source-font twin by PDF object number (strict check for subset outline).
+        internal PdfFont DisplayFont => WholeText ?? Primary ?? Fallback;
+    }
+
+    /// <summary>
+    /// Resolve the (primary, pool, fallback) font chain for a column plus a whole-text
+    /// pick when a single font can render every character. Mirrors
+    /// <see cref="AddParagraphStamper"/>'s two-font resolution — see the customer
+    /// regression 2026-09-04: the previous single-font path chose the source subset
+    /// even when it lacked glyphs, and the missing chars silently dropped.
+    /// </summary>
+    private static ColumnFonts ResolveColumnFonts(PageFontInventory inv, PdfDocument doc,
+        FontStyle style, string text, string newLiId, WriterFontCache? fontCache, ILogger log)
+    {
+        var primary = ResolvePreferredSourceFont(inv, style);
+        var fallback = ResolveFallbackFont(style, text, newLiId, fontCache, log);
+        var pool = style is null || string.IsNullOrWhiteSpace(style.Family)
+            ? (IReadOnlyList<PdfFont>)Array.Empty<PdfFont>()
+            : PageFontInventory.DocCandidatesByFamilyAndWeight(doc, style.Family, style.Weight);
+
+        // Prefer a single font that covers everything (Adobe treats Tf switches as
+        // paragraph boundaries — matters most for LBody where a mid-run swap makes
+        // Adobe's Edit-PDF split the item into fragments).
+        PdfFont? wholeText = primary is not null && inv.CanRenderStrict(primary, text)
+            ? primary : null;
+        if (wholeText is null)
+        {
+            foreach (var candidate in pool)
+            {
+                if (primary is not null && ReferenceEquals(candidate, primary)) continue;
+                if (inv.CanRenderStrict(candidate, text))
+                {
+                    wholeText = candidate;
+                    break;
+                }
+            }
+        }
+        if (wholeText is null && PageFontInventory.CanRender(fallback, text))
+        {
+            wholeText = fallback;
+        }
+        return new ColumnFonts(primary, pool, fallback, wholeText);
+    }
+
+    /// <summary>
+    /// Source-embedded twin the column would like to use as its display font. Uses
+    /// tier 1 (exact by objNum) then tier 2 (family+weight from page inventory) with
+    /// lenient CanRender — the strict outline check is deferred to
+    /// <see cref="MultiFontLineEmitter"/>'s per-char pick.
+    /// </summary>
+    private static PdfFont? ResolvePreferredSourceFont(PageFontInventory inv, FontStyle style)
+    {
+        if (style is null) return null;
         if (style.SourceFontObjNumber is { } objNum)
         {
             var exact = inv.FindByObjNumber(objNum);
-            if (exact is not null && inv.CanRenderStrict(exact, text))
-            {
-                return exact;
-            }
+            if (exact is not null) return exact;
         }
-        // Tier 2: family+weight candidates already embedded on this page (strict check).
         if (!string.IsNullOrWhiteSpace(style.Family))
         {
             foreach (var candidate in inv.CandidatesByFamilyAndWeight(style.Family, style.Weight))
             {
-                if (inv.CanRenderStrict(candidate, text)) return candidate;
-            }
-            // Tier 2.5: exact-full-name twins that pass the cmap check. Strict can
-            // false-negative on the writer-side doc (rendered-chars scan runs on the
-            // already-mutated streams), and a subset's pruned cmap is an honest coverage
-            // signal for the very font the donor text renders with. Falling through to
-            // the universal fallback here would swap the face entirely — worse than
-            // trusting the cmap of the same-named twin.
-            var targetName = PageFontInventory.FullNameKey(style.Family);
-            foreach (var candidate in inv.CandidatesByFamilyAndWeight(style.Family, style.Weight))
-            {
-                var candName = PageFontInventory.FullNameKey(
-                    candidate.GetFontProgram()?.GetFontNames()?.GetFontName());
-                if (!string.Equals(candName, targetName, StringComparison.Ordinal)) continue;
-                if (PageFontInventory.CanRender(candidate, text)) return candidate;
+                return candidate;
             }
         }
-        // Tier 3: fresh system font.
-        if (!string.IsNullOrWhiteSpace(style.Family))
+        return null;
+    }
+
+    /// <summary>
+    /// Guaranteed-outline fallback for chars the source font can't render. System
+    /// (family) → universal (bucket) → standard-14 (last resort — fails PDF/UA).
+    /// </summary>
+    private static PdfFont ResolveFallbackFont(FontStyle style, string text,
+        string newLiId, WriterFontCache? fontCache, ILogger log)
+    {
+        if (style is not null && !string.IsNullOrWhiteSpace(style.Family))
         {
             var system = fontCache is not null
                 ? fontCache.Load(style.Family, style.Weight)
@@ -274,16 +343,12 @@ internal static class AddListItemStamper
                 return system;
             }
         }
-        // Tier 4: universal serif/mono/default fallback.
         var universal = fontCache is not null
             ? fontCache.LoadUniversalFallback(style)
             : SystemFontLocator.LoadUniversalFallback(style);
-        if (universal is not null && PageFontInventory.CanRender(universal, text))
-        {
-            return universal;
-        }
+        if (universal is not null) return universal;
         log.LogWarning("addListItem {Id}: falling back to non-embedded standard-14 for '{Text}' — will fail PDF/UA Font-embedding check",
             newLiId, text.Length > 30 ? text[..30] + "..." : text);
-        return PdfFontFactory.CreateFont(StandardFontMapper.MapToStandardFont(style));
+        return PdfFontFactory.CreateFont(StandardFontMapper.MapToStandardFont(style!));
     }
 }
