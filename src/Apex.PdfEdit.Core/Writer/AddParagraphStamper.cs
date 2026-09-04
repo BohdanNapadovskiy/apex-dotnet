@@ -111,7 +111,7 @@ internal static class AddParagraphStamper
                 if (ReferenceEquals(candidate, primary)) continue;
                 if (inv.CanRenderStrict(candidate, overlay.NewContent))
                 {
-                    EnsureFontRegistered(page, candidate);
+                    MultiFontLineEmitter.EnsureFontRegistered(page, candidate);
                     wholeText = candidate;
                     break;
                 }
@@ -179,7 +179,7 @@ internal static class AddParagraphStamper
             }
             else
             {
-                EmitLineWithFontSplit(canvas, line, primary, docPool, fallback, 1f, inv, page);
+                MultiFontLineEmitter.EmitLine(canvas, line, primary, docPool, fallback, 1f, inv, page);
             }
         }
         canvas.EndText().EndMarkedContent().RestoreState();
@@ -236,63 +236,8 @@ internal static class AddParagraphStamper
         return mcrRef is not null && mcrRef.Equals(pageRef);
     }
 
-    /// <summary>
-    /// Split <paramref name="line"/> into runs by which font can outline each char, then
-    /// emit each run as its own <c>/Font size Tf (text)Tj</c> pair. Both fonts share the
-    /// same current text matrix so runs draw at consecutive positions on the same baseline.
-    /// </summary>
-    private static void EmitLineWithFontSplit(PdfCanvas canvas, string line,
-        PdfFont? primary, IReadOnlyList<PdfFont> docPool, PdfFont fallback,
-        float fontSize, PageFontInventory inv, PdfPage page)
-    {
-        if (string.IsNullOrEmpty(line)) return;
-        if (primary is null)
-        {
-            canvas.ShowText(line);
-            return;
-        }
-        var run = new StringBuilder();
-        PdfFont? current = null;
-        for (int i = 0; i < line.Length;)
-        {
-            int cp = char.ConvertToUtf32(line, i);
-            var ch = char.ConvertFromUtf32(cp);
-            var pick = PickFontForChar(ch, primary, docPool, fallback, inv, page);
-            current ??= pick;
-            if (!ReferenceEquals(pick, current))
-            {
-                canvas.SetFontAndSize(current, fontSize).ShowText(run.ToString());
-                run.Clear();
-                current = pick;
-            }
-            run.Append(ch);
-            i += char.IsHighSurrogate(line[i]) ? 2 : 1;
-        }
-        if (run.Length > 0 && current is not null)
-        {
-            canvas.SetFontAndSize(current, fontSize).ShowText(run.ToString());
-        }
-    }
-
-    /// <summary>
-    /// Try <paramref name="primary"/>, then each doc-pool candidate (registered on the page's
-    /// resources on first use), then <paramref name="fallback"/>.
-    /// </summary>
-    private static PdfFont PickFontForChar(string ch, PdfFont primary,
-        IReadOnlyList<PdfFont> docPool, PdfFont fallback, PageFontInventory inv, PdfPage page)
-    {
-        if (inv.CanRenderStrict(primary, ch)) return primary;
-        foreach (var candidate in docPool)
-        {
-            if (ReferenceEquals(candidate, primary)) continue;
-            if (inv.CanRenderStrict(candidate, ch))
-            {
-                EnsureFontRegistered(page, candidate);
-                return candidate;
-            }
-        }
-        return fallback;
-    }
+    // Per-char font split extracted to MultiFontLineEmitter so AddListItemStamper +
+    // ContentStreamMcidReplacer share the same behavior.
 
     /// <summary>
     /// Rank candidates by PostScript-name affinity to source's style so a Regular request
@@ -333,22 +278,6 @@ internal static class AddParagraphStamper
         if (string.Equals(cand, want, StringComparison.Ordinal)) return 0;
         if (cand.StartsWith(want, StringComparison.Ordinal) || want.StartsWith(cand, StringComparison.Ordinal)) return 1;
         return 2;
-    }
-
-    /// <summary>
-    /// Add <paramref name="font"/> to the page's /Resources /Font dict if it isn't already
-    /// there, so a <c>/Fn size Tf</c> op inside the added block can reference it.
-    /// </summary>
-    private static void EnsureFontRegistered(PdfPage page, PdfFont font)
-    {
-        try
-        {
-            page.GetResources().AddFont(page.GetDocument(), font);
-        }
-        catch
-        {
-            // Registration failure — canvas will still register lazily on SetFontAndSize.
-        }
     }
 
     private static float AlignedX(AddParagraphOverlay overlay, PdfFont font, float fontSize, string lineText)
