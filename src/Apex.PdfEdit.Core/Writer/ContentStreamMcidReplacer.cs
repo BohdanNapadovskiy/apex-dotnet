@@ -485,11 +485,24 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         IList<PdfObject>? emitTcOperands = _firstTcInBlock ?? _tcAtBdcOpen;
         IList<PdfObject>? emitTwOperands = _firstTwInBlock ?? _twAtBdcOpen;
 
-        // Fold source's per-glyph TJ kerning into an equivalent Tc.
-        if (_firstTjAvgKernPer1000 is { } avgKern && Math.Abs(avgKern) > 0.01 && emitTcOperands is not null)
+        // Multi-line justified paragraphs: we restore right-edge alignment via per-line Tw
+        // (see the loop below), so skip the TJ→Tc kerning fold — that fold was designed for
+        // typography kerning (InDesign titles), but a JUSTIFIED paragraph's per-glyph TJ
+        // spread is really justification, not kerning. Folding it here and then re-inflating
+        // Tw would double-space.
+        bool justifyLines = overlay.Alignment == Alignment.Justified
+            && lines.Count > 1
+            && bboxWidth > 0;
+
+        // Fold source's per-glyph TJ kerning into an equivalent Tc — unless we're about to
+        // Tw-justify, in which case the fold is a false positive.
+        if (!justifyLines
+            && _firstTjAvgKernPer1000 is { } avgKern
+            && Math.Abs(avgKern) > 0.01
+            && emitTcOperands is not null)
         {
-            double baseTc = NumFromOperands(emitTcOperands);
-            double effectiveTc = baseTc + avgKern * fontSize / 1000.0;
+            double srcTc = NumFromOperands(emitTcOperands);
+            double effectiveTc = srcTc + avgKern * fontSize / 1000.0;
             double rounded = Math.Round(effectiveTc * 10000.0) / 10000.0;
             emitTcOperands = new List<PdfObject>
             {
@@ -499,6 +512,11 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         }
         if (emitTcOperands is not null) WriteOperandsAndOperator(emitTcOperands);
         if (emitTwOperands is not null) WriteOperandsAndOperator(emitTwOperands);
+
+        // Snapshot the base spacing so per-line justification math starts from the
+        // correct source values instead of whatever a prior line left in Tw.
+        double baseTc = emitTcOperands is not null ? NumFromOperands(emitTcOperands) : 0.0;
+        double baseTw = emitTwOperands is not null ? NumFromOperands(emitTwOperands) : 0.0;
 
         // Multi-run vs single-style emit.
         List<InlineSegment>? segments = lines.Count == 1
@@ -538,6 +556,11 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
+                if (justifyLines)
+                {
+                    double lineTw = JustifiedTw(line, font, fontSize, bboxWidth, baseTc, baseTw, i == lines.Count - 1);
+                    _outStream.WriteString(lineTw.ToString("F6", CultureInfo.InvariantCulture) + " Tw\n");
+                }
                 float lineX = AlignedX(overlay, font, fontSize, line);
                 float lineY = baselineY - i * lineHeight;
                 _outCanvas.SetTextMatrix(lineX, lineY);
@@ -753,6 +776,34 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         {
             return "(unknown)";
         }
+    }
+
+    /// <summary>
+    /// Compute the word-spacing (<c>Tw</c>) that stretches <paramref name="lineText"/> to
+    /// exactly fill <paramref name="bboxWidth"/>. Last line of a paragraph and lines with
+    /// no spaces or with tolerable natural width fall back to <paramref name="baseTw"/>.
+    /// A per-space cap of <c>fontSize/2</c> prevents an under-full trailing line from
+    /// blowing up into visible gaps.
+    /// </summary>
+    internal static double JustifiedTw(string lineText, PdfFont font, float fontSize,
+        float bboxWidth, double baseTc, double baseTw, bool isLastLine)
+    {
+        if (isLastLine) return baseTw;
+        int spaces = 0;
+        for (int i = 0; i < lineText.Length; i++)
+        {
+            if (lineText[i] == ' ') spaces++;
+        }
+        if (spaces == 0) return baseTw;
+        double glyphWidth = font.GetWidth(lineText, fontSize);
+        double naturalWidth = glyphWidth
+            + baseTc * Math.Max(0, lineText.Length - 1)
+            + baseTw * spaces;
+        double extra = bboxWidth - naturalWidth;
+        if (extra <= 0) return baseTw;
+        double perSpace = extra / spaces;
+        if (perSpace > fontSize * 0.5) return baseTw;
+        return baseTw + perSpace;
     }
 
     /// <summary>
