@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using Apex.PdfEdit.Core.Edit;
 using Apex.PdfEdit.Core.Layout;
 using iText.Kernel.Colors;
@@ -46,6 +47,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     /// of the effective font size. Empirically ~0.3 × fontSize on the corpus.
     /// </summary>
     private const float DescenderAdjustRatio = 0.3f;
+
+    /// <summary>
+    /// Recognises a Table-of-Contents row: any content that ends with whitespace + one
+    /// or more digits (the page number). Group 1 is the title, group 2 is the pagenum.
+    /// Used by the TOC-shape re-emit path in <see cref="EmitReplacement"/>.
+    /// </summary>
+    internal static readonly Regex TocRowPattern =
+        new(@"^(.+?)\s+(\d+)\s*$", RegexOptions.Compiled);
 
     private readonly IReadOnlyDictionary<int, SetTextOverlay> _byMcid;
     private readonly WriterFontCache? _fontCache;
@@ -111,6 +120,15 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     // The Tm in effect when _firstTjDyInBlock was captured — the frame that dy is
     // measured against (mid-block Tm resets must not retarget it).
     private IList<PdfObject>? _tmAtFirstTjInBlock;
+
+    // P2 (2026-09-07) leader suppression state. When a TOC-style row is re-emitted with
+    // in-place dots + right-anchored pagenum (see EmitReplacement), the source's original
+    // dot-leader artifact BMC blocks must be silenced or they'd double-print on top of our
+    // fresh leader. Non-null between the target's EMC and the next tagged BDC.
+    private double? _leaderSuppressYMin;
+    private double? _leaderSuppressYMax;
+    private bool _insideArtifactBlock;
+    private bool _suppressCurrentArtifactText;
 
     private ContentStreamMcidReplacer(
         IReadOnlyDictionary<int, SetTextOverlay> byMcid,
@@ -280,6 +298,10 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         if ("BDC".Equals(opName, StringComparison.Ordinal) && operands.Count >= 3)
         {
+            // Any tagged BDC after a modified target's EMC closes the visual row —
+            // stop suppressing leader artifacts.
+            _leaderSuppressYMin = null;
+            _leaderSuppressYMax = null;
             int mcid = ExtractInlineMcid(operands[1]);
             if (_activeTargetMcid < 0 && _byMcid.ContainsKey(mcid))
             {
@@ -289,6 +311,17 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 _tcAtBdcOpen = _lastTcOperands is null ? null : new List<PdfObject>(_lastTcOperands);
                 _twAtBdcOpen = _lastTwOperands is null ? null : new List<PdfObject>(_lastTwOperands);
             }
+            WriteOperandsAndOperator(operands);
+            return;
+        }
+
+        // Untagged BMC — mark artifact regions so we can silence dot leaders whose
+        // baseline coincides with a just-modified TOC row.
+        if ("BMC".Equals(opName, StringComparison.Ordinal) && operands.Count >= 1)
+        {
+            _insideArtifactBlock = operands[0] is PdfName tag
+                && "Artifact".Equals(tag.GetValue(), StringComparison.Ordinal);
+            _suppressCurrentArtifactText = false;
             WriteOperandsAndOperator(operands);
             return;
         }
@@ -314,6 +347,39 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             return;
         }
 
+        // Close an artifact BMC (or any untagged marked-content section) — reset the
+        // per-block leader-suppression flag.
+        if ("EMC".Equals(opName, StringComparison.Ordinal) && _insideArtifactBlock)
+        {
+            _insideArtifactBlock = false;
+            _suppressCurrentArtifactText = false;
+            WriteOperandsAndOperator(operands);
+            return;
+        }
+
+        // Inside an artifact BMC on a suppressed Y-band: the first Td/Tm gives the
+        // block's absolute baseline (BT resets Tm to identity). If it matches the
+        // just-modified row's Y, mark subsequent text-showing ops for suppression.
+        if (_insideArtifactBlock
+            && !_suppressCurrentArtifactText
+            && _leaderSuppressYMin is { } yMin
+            && _leaderSuppressYMax is { } yMax)
+        {
+            double? absY = null;
+            if ((opName == "Td" || opName == "TD") && operands.Count >= 2 && operands[1] is PdfNumber tdY)
+            {
+                absY = tdY.DoubleValue();
+            }
+            else if (opName == "Tm" && operands.Count >= 6 && operands[5] is PdfNumber tmY)
+            {
+                absY = tmY.DoubleValue();
+            }
+            if (absY is { } y && y >= yMin && y <= yMax)
+            {
+                _suppressCurrentArtifactText = true;
+            }
+        }
+
         if (_activeTargetMcid >= 0 && IsTextRelatedOp(opName))
         {
             // Snapshot source's text-line matrix at the first drawn glyph.
@@ -328,6 +394,12 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 _firstTjAvgKernPer1000 = AverageTjKerningPer1000(opName, operands);
             }
             // Drop the source's original text op.
+            return;
+        }
+
+        // Drop the text-showing op inside a suppressed artifact block.
+        if (_suppressCurrentArtifactText && IsTextShowingOp(opName))
+        {
             return;
         }
 
@@ -518,12 +590,33 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         double baseTc = emitTcOperands is not null ? NumFromOperands(emitTcOperands) : 0.0;
         double baseTw = emitTwOperands is not null ? NumFromOperands(emitTwOperands) : 0.0;
 
+        // P2 (2026-09-07): TOC-row detection. A JUSTIFIED single-line replacement whose
+        // content parses as "title <spaces> <digits>" is a Table-of-Contents row. If we
+        // emit the whole string left-anchored (the default), the pagenum ends up in the
+        // middle of the row and the source's dot-leader artifacts still render at their
+        // original X — visually colliding with the modified title (Ram UAT row 7 —
+        // "7.0 Keys and locks .Test.content.added.here .. 10 . . . . ."). Re-emit as
+        // title-at-left + fresh dots + pagenum-right and register a Y-band so the
+        // source's artifact leader ops on this baseline get suppressed downstream.
+        var tocMatch = TocRowPattern.Match(overlay.NewContent ?? string.Empty);
+        bool isTocRow = tocMatch.Success
+            && overlay.Alignment == Alignment.Justified
+            && bboxWidth > 200f
+            && lines.Count == 1;
+
         // Multi-run vs single-style emit.
-        List<InlineSegment>? segments = lines.Count == 1
+        List<InlineSegment>? segments = !isTocRow && lines.Count == 1
             ? SegmentByRuns(lines[0], overlay.SourceRuns, style)
             : null;
 
-        if (segments is not null && segments.Count > 1)
+        if (isTocRow)
+        {
+            EmitTocRow(overlay, font, fontSize, color, baselineY, bboxWidth,
+                tocMatch.Groups[1].Value, tocMatch.Groups[2].Value);
+            _leaderSuppressYMin = baselineY - 3.0;
+            _leaderSuppressYMax = baselineY + 3.0;
+        }
+        else if (segments is not null && segments.Count > 1)
         {
             var line = lines[0];
             float lineX = AlignedX(overlay, font, fontSize, line);
@@ -610,6 +703,58 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             _outStream.WriteString("0 g\n");
         }
         if (!_insideTextObject) _outCanvas.EndText();
+    }
+
+    /// <summary>
+    /// TOC-shaped emit path — renders <paramref name="title"/> at the bbox left edge,
+    /// fills the gap with fresh dot leaders, and right-anchors <paramref name="pagenum"/>
+    /// against the bbox right edge. Zeroes out inherited Tc/Tw so the width math matches
+    /// the actual rendering; the shared restore at the bottom of <see cref="EmitReplacement"/>
+    /// puts the source's spacing state back for downstream blocks.
+    /// </summary>
+    private void EmitTocRow(SetTextOverlay overlay, PdfFont font, float fontSize,
+        iText.Kernel.Colors.Color color, float baselineY, float bboxWidth,
+        string title, string pagenum)
+    {
+        // Zero Tc/Tw so title/pagenum width math matches the emitted glyph advance.
+        _outStream.WriteString("0 Tc\n0 Tw\n");
+        EmitFillColorRaw(color);
+        _outCanvas.SetFontAndSize(font, fontSize).SetLeading(fontSize * EffectiveLeadingMultiplier(overlay.Style));
+
+        float leftX = (float)overlay.X;
+        float titleWidth = font.GetWidth(title, fontSize);
+        float pagenumWidth = font.GetWidth(pagenum, fontSize);
+        float pagenumX = leftX + bboxWidth - pagenumWidth;
+
+        // Title at leftmost.
+        _outCanvas.SetTextMatrix(leftX, baselineY);
+        _outCanvas.ShowText(title);
+
+        // Fresh dot leader between title-end (+ breathing gap) and pagenum-start
+        // (- breathing gap). Skip when the title already overruns the pagenum slot.
+        const float LeaderGap = 4.0f;
+        const string DotUnit = ". ";
+        float leaderStart = leftX + titleWidth + LeaderGap;
+        float leaderEnd = pagenumX - LeaderGap;
+        if (leaderEnd > leaderStart)
+        {
+            float unitWidth = font.GetWidth(DotUnit, fontSize);
+            if (unitWidth > 0.1f)
+            {
+                int nUnits = (int)((leaderEnd - leaderStart) / unitWidth);
+                if (nUnits > 0)
+                {
+                    var leader = new StringBuilder(nUnits * DotUnit.Length);
+                    for (int i = 0; i < nUnits; i++) leader.Append(DotUnit);
+                    _outCanvas.SetTextMatrix(leaderStart, baselineY);
+                    _outCanvas.ShowText(leader.ToString());
+                }
+            }
+        }
+
+        // Pagenum right-anchored.
+        _outCanvas.SetTextMatrix(pagenumX, baselineY);
+        _outCanvas.ShowText(pagenum);
     }
 
     /// <summary>

@@ -157,6 +157,36 @@ public sealed class RamCampusHousingRegressionTests
     }
 
     [FactIfSample(RamPdf)]
+    public void TocRowKeepsPagenumRightAnchored()
+    {
+        // P2: the customer's edit adds "Test content added here." between the title and
+        // the pagenum ("7.0 Keys and locks Test content added here. 10"). Pre-P2 that
+        // was emitted as a single left-anchored string and the source's dot leaders
+        // still rendered at their original X — visual pile-up. The TOC-row re-emit
+        // splits title / dots / pagenum: title at the left, fresh dots, "10"
+        // right-anchored near the body-column right edge (~527pt).
+        var bytes = RunPipeline();
+        using var reader = new PdfReader(new MemoryStream(bytes));
+        using var pdf = new PdfDocument(reader);
+
+        var chunks = CollectRowChunks(pdf, page: 1, needle: "Keys and locks");
+        chunks.Should().NotBeEmpty("expected to find the 'Keys and locks' TOC row on page 1");
+
+        chunks[0].StartX.Should().BeApproximately(85.0, 3.0,
+            "the TOC title should start at the body column's left margin");
+
+        var pagenumChunk = chunks.LastOrDefault(c => c.Text.Trim() == "10");
+        pagenumChunk.Text.Should().Be("10",
+            "the pagenum should be emitted as its own text run at the row's right edge");
+        pagenumChunk.EndX.Should().BeApproximately(527.0, 3.0,
+            "the pagenum's right edge should align with the body column right margin");
+
+        bool hasLeader = chunks.Any(c => c.StartX > 200 && c.StartX < 500
+                                         && c.Text.Contains('.'));
+        hasLeader.Should().BeTrue("fresh dot leader should fill the gap between title and pagenum");
+    }
+
+    [FactIfSample(RamPdf)]
     public void ModifiedHeadingStaysAtSourcePosition()
     {
         // Node 215 ("3.4 Deposits and initial payments") sits below a table on page 5.
@@ -218,6 +248,45 @@ public sealed class RamCampusHousingRegressionTests
         throw new Xunit.Sdk.XunitException(
             "expected to find '" + needle + "' on page " + page +
             " but no baseline line contained it");
+    }
+
+    /// <summary>
+    /// Return every text chunk (start-X, end-X, decoded text) on the baseline whose
+    /// concatenated line contains <paramref name="needle"/>, sorted left-to-right.
+    /// Used by <see cref="TocRowKeepsPagenumRightAnchored"/> to assert the geometry
+    /// of the re-emitted TOC row.
+    /// </summary>
+    private readonly record struct RowChunk(double StartX, double EndX, string Text);
+
+    private static IReadOnlyList<RowChunk> CollectRowChunks(PdfDocument pdf, int page, string needle)
+    {
+        var byLine = new SortedDictionary<int, List<RowChunk>>();
+        var listener = new TextRenderListener(tri =>
+        {
+            var s = tri.GetText();
+            if (string.IsNullOrEmpty(s)) return;
+            var start = tri.GetBaseline().GetStartPoint();
+            var end = tri.GetBaseline().GetEndPoint();
+            int bucket = (int)Math.Round(start.Get(1));
+            if (!byLine.TryGetValue(bucket, out var list))
+            {
+                list = new List<RowChunk>();
+                byLine[bucket] = list;
+            }
+            list.Add(new RowChunk(start.Get(0), end.Get(0), s));
+        });
+        new PdfCanvasProcessor(listener).ProcessPageContent(pdf.GetPage(page));
+
+        foreach (var list in byLine.Values)
+        {
+            list.Sort((a, b) => a.StartX.CompareTo(b.StartX));
+            var joined = string.Concat(list.Select(c => c.Text));
+            if (joined.Contains(needle, StringComparison.Ordinal))
+            {
+                return list;
+            }
+        }
+        return Array.Empty<RowChunk>();
     }
 
     /// <summary>
