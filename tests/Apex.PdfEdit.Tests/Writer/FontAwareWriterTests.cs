@@ -32,7 +32,7 @@ public sealed class FontAwareWriterTests
         var bytes = outBuf.ToArray();
         bytes.Should().NotBeEmpty();
 
-        var debug = Path.Combine(TestOutputs.ForSample(Sample), Sample + "_font-aware.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(Sample), Sample + "_font-aware.pdf");
         File.WriteAllBytes(debug, bytes);
 
         using var reader = new PdfReader(new MemoryStream(bytes));

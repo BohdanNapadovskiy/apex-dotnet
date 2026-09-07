@@ -248,11 +248,11 @@ public sealed class PageFontInventory
             else otherType0.Add(f);
         }
         var output = new List<PdfFont>(weightSimple.Count + weightType0.Count + otherSimple.Count + otherType0.Count);
-        output.AddRange(weightSimple);
-        output.AddRange(weightType0);
-        output.AddRange(otherSimple);
-        output.AddRange(otherType0);
-        return OrderExactNameFirst(output, family);
+        output.AddRange(OrderExactNameFirst(weightSimple, family));
+        output.AddRange(OrderExactNameFirst(weightType0, family));
+        output.AddRange(OrderExactNameFirst(otherSimple, family));
+        output.AddRange(OrderExactNameFirst(otherType0, family));
+        return output;
     }
 
     /// <summary>
@@ -261,6 +261,10 @@ public sealed class PageFontInventory
     /// "UniversCom-45Light" and "UniversCom-47LightCond" share a stem — without this
     /// preference a stem-only walk can dress body text in the condensed twin (Bessemer p2
     /// addListItem picked 47LightCond over the donor's 45Light).
+    ///
+    /// Applied per weight bucket by callers so the weight preference stays authoritative:
+    /// a regular-weight exact-name match must not leapfrog a bold weight-matching font when
+    /// the caller asked for bold (Verdana Regular vs Verdana,Bold on form-40x p1).
     /// </summary>
     private static List<PdfFont> OrderExactNameFirst(List<PdfFont> fonts, string? family)
     {
@@ -336,11 +340,11 @@ public sealed class PageFontInventory
             else otherType0.Add(f);
         }
         var output = new List<PdfFont>(weightSimple.Count + weightType0.Count + otherSimple.Count + otherType0.Count);
-        output.AddRange(weightSimple);
-        output.AddRange(weightType0);
-        output.AddRange(otherSimple);
-        output.AddRange(otherType0);
-        return OrderExactNameFirst(output, family);
+        output.AddRange(OrderExactNameFirst(weightSimple, family));
+        output.AddRange(OrderExactNameFirst(weightType0, family));
+        output.AddRange(OrderExactNameFirst(otherSimple, family));
+        output.AddRange(OrderExactNameFirst(otherType0, family));
+        return output;
     }
 
     /// <summary>True if <paramref name="f"/> is a Type0/CID composite font.</summary>

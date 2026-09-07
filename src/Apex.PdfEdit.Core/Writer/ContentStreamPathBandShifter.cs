@@ -42,6 +42,7 @@ namespace Apex.PdfEdit.Core.Writer;
 internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
 {
     private readonly IReadOnlyList<PathBandOverlay> _bands;
+    private readonly IReadOnlyList<DecorShiftOverlay> _decors;
 
     /// <summary>
     /// Marked-content stack — one entry per open BMC/BDC, true iff the entry carries
@@ -87,10 +88,12 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
         public bool IsShiftSafe => Math.Abs(B) <= 1e-3 && Math.Abs(C) <= 1e-3 && A > 0 && D > 0;
     }
 
-    private ContentStreamPathBandShifter(IReadOnlyList<PathBandOverlay> bands)
+    private ContentStreamPathBandShifter(IReadOnlyList<PathBandOverlay> bands,
+        IReadOnlyList<DecorShiftOverlay> decors)
         : base(new ContentStreamHelpers.NoOpListener())
     {
         _bands = bands;
+        _decors = decors;
     }
 
     /// <summary>
@@ -98,10 +101,12 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
     /// Runs AFTER <see cref="ContentStreamMcidMover"/> so shifts on tagged content are
     /// already committed to /Contents before we walk the stream a second time.
     /// </summary>
-    internal static void Apply(PdfPage page, IReadOnlyList<PathBandOverlay>? bands)
+    internal static void Apply(PdfPage page, IReadOnlyList<PathBandOverlay>? bands,
+        IReadOnlyList<DecorShiftOverlay>? decors = null)
     {
         ArgumentNullException.ThrowIfNull(page);
         if (bands is null || bands.Count == 0) return;
+        decors ??= Array.Empty<DecorShiftOverlay>();
 
         var originalBytes = page.GetContentBytes();
         if (originalBytes is null || originalBytes.Length == 0) return;
@@ -112,7 +117,7 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
         page.GetPdfObject().SetModified();
         ContentStreamHelpers.StripAppleHashKeys(page);
 
-        var proc = new ContentStreamPathBandShifter(bands)
+        var proc = new ContentStreamPathBandShifter(bands, decors)
         {
             _out = freshContent.GetOutputStream()
         };
@@ -238,11 +243,13 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
     /// </summary>
     private double ComposePointShift(double devX, double devY)
     {
+        if (TryOwnerDy(devX, devY, devX, devX, out double ownerDy)) return ownerDy;
         double total = 0;
         double cur = devY;
         foreach (var band in _bands)
         {
             if (devX < band.LeftX || devX > band.RightX) continue;
+            if (InKeepOut(band, devX, cur)) continue;
             if (cur < band.BandTopY)
             {
                 total += band.Dy;
@@ -250,6 +257,55 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
             }
         }
         return total;
+    }
+
+    /// <summary>
+    /// Ownership pairing: when the point/path centre falls inside a pushed-down node's
+    /// ORIGINAL bbox (small slack; underlines hang a few points below the baseline), the
+    /// decoration moves by exactly that owner's cumulative dy — never by band composition,
+    /// which overshoots when sequential ops shift different chains (form-40x p2 pills).
+    /// Wide decorations (section backgrounds) stay with the band rule: a path much wider
+    /// than the candidate owner is not "its" decoration.
+    /// </summary>
+    private bool TryOwnerDy(double cx, double cy, double pathMinX, double pathMaxX, out double dy)
+    {
+        dy = 0;
+        DecorShiftOverlay? best = null;
+        double bestArea = double.PositiveInfinity;
+        foreach (var d in _decors)
+        {
+            if (cx < d.X - 3 || cx > d.X + d.Width + 3) continue;
+            if (cy < d.Y - 4 || cy > d.Y + d.Height + 2) continue;
+            if (pathMaxX - pathMinX > d.Width + 30) continue;
+            double area = d.Width * d.Height;
+            if (area < bestArea)
+            {
+                bestArea = area;
+                best = d;
+            }
+        }
+        if (best is null) return false;
+        dy = best.Dy;
+        return true;
+    }
+
+    /// <summary>
+    /// True when the point sits inside a region whose tagged text the engine chose NOT to
+    /// shift — its decorations must not be swept by this band (UDO p2 TOC underlines).
+    /// </summary>
+    private static bool InKeepOut(PathBandOverlay band, double devX, double devY)
+    {
+        if (band.KeepOut is null) return false;
+        const double slack = 2.0;
+        foreach (var r in band.KeepOut)
+        {
+            if (devX > r.X - slack && devX < r.X + r.Width + slack
+                && devY > r.Y - slack && devY < r.Y + r.Height + slack)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
@@ -266,9 +322,20 @@ internal sealed class ContentStreamPathBandShifter : PdfCanvasProcessor
                 bool singleRe = buffered.Count == 1 && buffered[0].Op == "re";
                 double devDy = 0, growDevH = 0;
                 double curBottom = bbox.MinY, curTop = bbox.MaxY;
+                if (TryOwnerDy((bbox.MinX + bbox.MaxX) / 2, (bbox.MinY + bbox.MaxY) / 2,
+                        bbox.MinX, bbox.MaxX, out double ownerDy))
+                {
+                    if (ownerDy != 0)
+                    {
+                        EmitShiftedPath(buffered, ownerDy / _ctm.D, 0);
+                        WriteOperandsAndOperator(paintOperands);
+                        return;
+                    }
+                }
                 foreach (var band in _bands)
                 {
                     if (bbox.MaxX < band.LeftX || bbox.MinX > band.RightX) continue; // other column
+                    if (InKeepOut(band, (bbox.MinX + bbox.MaxX) / 2, (curBottom + curTop) / 2)) continue;
                     if (curBottom >= band.BandTopY) continue;      // entirely above — unchanged
                     if (curTop <= band.BandTopY)                    // entirely below — translate
                     {

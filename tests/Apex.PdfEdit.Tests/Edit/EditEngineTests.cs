@@ -59,8 +59,12 @@ public sealed class EditEngineTests
         o.Style.Family.Should().NotBeNullOrWhiteSpace();
     }
 
+    // P2 semantics (2026-09-04): when a char is missing from the source subset but
+    // the embedded system fallback (Arial-family) can render it, the op proceeds
+    // and the writer emits that char via the fallback face. Only truly unrenderable
+    // code points (nothing in the fallback pipeline covers them) yield an EditIssue.
     [FactIfSample(PdfPath)]
-    public void SetTextRefusesGlyphNotInSourceFontSubset()
+    public void SetTextAcceptsGlyphNotInSourceButCoveredByFallback()
     {
         var doc = DocumentJsonLoader.Load(TestSamples.Resolve(DocPath));
         var edits = new EditsJson
@@ -71,9 +75,68 @@ public sealed class EditEngineTests
         using var resolver = new SourcePdfFontResolver(TestSamples.Resolve(PdfPath));
         var result = new EditEngine(resolver).Apply(doc, edits);
 
+        result.AppliedOpIds.Should().Equal(new[] { "e1" },
+            "the fallback face covers 'K' — op should apply cleanly");
+        result.Issues.Should().BeEmpty();
+        result.Plan.SetTextOverlays.Should().HaveCount(1);
+    }
+
+    [FactIfSample(PdfPath)]
+    public void AddListItemAcceptsBodyGlyphNotInSourceButCoveredByFallback()
+    {
+        var doc = DocumentJsonLoader.Load(TestSamples.Resolve(DocPath));
+        var edits = new EditsJson
+        {
+            Operations = { AddListItemOp.Of("a1", "290", -1, "•", "Kansas item", null) }
+        };
+
+        using var resolver = new SourcePdfFontResolver(TestSamples.Resolve(PdfPath));
+        var result = new EditEngine(resolver).Apply(doc, edits);
+
+        result.AppliedOpIds.Should().Equal("a1");
+        result.Issues.Should().BeEmpty();
+        result.Plan.AddListItemOverlays.Should().HaveCount(1);
+    }
+
+    [FactIfSample(PdfPath)]
+    public void AddParagraphAcceptsContentGlyphNotInSourceButCoveredByFallback()
+    {
+        var doc = DocumentJsonLoader.Load(TestSamples.Resolve(DocPath));
+        var edits = new EditsJson
+        {
+            Operations = { AddParagraphOp.Of("a1", "2", -1, "P", "Kansas paragraph", null) }
+        };
+
+        using var resolver = new SourcePdfFontResolver(TestSamples.Resolve(PdfPath));
+        var result = new EditEngine(resolver).Apply(doc, edits);
+
+        result.AppliedOpIds.Should().Equal("a1");
+        result.Issues.Should().BeEmpty();
+        result.Plan.AddParagraphOverlays.Should().HaveCount(1);
+    }
+
+    // Hard reject: a code point that neither the source subset NOR the embedded
+    // fallback can render (astral-plane emoji absent from Arial/Times/Courier).
+    [FactIfSample(PdfPath)]
+    public void SetTextRejectsGlyphMissingFromSourceAndFallback()
+    {
+        var doc = DocumentJsonLoader.Load(TestSamples.Resolve(DocPath));
+        // U+1F600 GRINNING FACE — not in Arial/Times/Courier basic outlines.
+        var edits = new EditsJson
+        {
+            Operations = { SetTextOp.Of("e1", "3", "hi \uD83D\uDE00 world") }
+        };
+
+        using var resolver = new SourcePdfFontResolver(TestSamples.Resolve(PdfPath));
+        var result = new EditEngine(resolver).Apply(doc, edits);
+
         result.AppliedOpIds.Should().BeEmpty();
+        result.Plan.SetTextOverlays.Should().BeEmpty();
         result.Issues.Should().HaveCount(1);
-        result.Issues[0].Message.Should().Contain("U+004B").And.Contain("'K'").And.Contain("embedded font subset");
+        result.Issues[0].Message.Should()
+            .Contain("U+1F600").And
+            .Contain("neither the source PDF's embedded font subset").And
+            .Contain("nor the writer's embedded system fallback");
     }
 
     [Fact]
@@ -1048,7 +1111,7 @@ public sealed class EditEngineTests
             new SourceBasedWriter(pdfPath).Write(result.Plan, outBuf);
         }
 
-        var debug = Path.Combine(TestOutputs.ForSample(SampleDir), SampleDir + "_edit.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(SampleDir), SampleDir + "_edit.pdf");
         File.WriteAllBytes(debug, outBuf.ToArray());
 
         using var reader = new PdfReader(new MemoryStream(outBuf.ToArray()));
@@ -1066,7 +1129,11 @@ public sealed class EditEngineTests
         var pdfPath = TestSamples.Resolve(PdfPath);
         var doc = DocumentJsonLoader.Load(docPath);
 
-        var newText = "APEX-ADDED-POC";
+        // Style donor id=284 (page 1 mcid 125) reads "PLEASE DO NOT WRITE IN THIS SPACE";
+        // its font subset covers those letters. The hyphen the earlier fixture used was
+        // silently dropped before the P1 font-subset pre-flight — see
+        // AddParagraphRefusesContentGlyphNotInSourceFontSubset.
+        var newText = "NEW ADDED TEST";
         var edits = new EditsJson
         {
             Operations = { AddParagraphOp.Of("a1", "2", -1, "P", newText, null) }
@@ -1092,7 +1159,7 @@ public sealed class EditEngineTests
             new SourceBasedWriter(pdfPath).Write(result.Plan, outBuf);
         }
 
-        var debug = Path.Combine(TestOutputs.ForSample(SampleDir), SampleDir + "_add.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(SampleDir), SampleDir + "_add.pdf");
         File.WriteAllBytes(debug, outBuf.ToArray());
 
         using var reader = new PdfReader(new MemoryStream(outBuf.ToArray()));
@@ -1132,7 +1199,7 @@ public sealed class EditEngineTests
             new SourceBasedWriter(pdfPath).Write(result.Plan, outBuf);
         }
 
-        var debug = Path.Combine(TestOutputs.ForSample(SampleDir), SampleDir + "_delete.pdf");
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(SampleDir), SampleDir + "_delete.pdf");
         File.WriteAllBytes(debug, outBuf.ToArray());
 
         using var reader = new PdfReader(new MemoryStream(outBuf.ToArray()));

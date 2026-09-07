@@ -84,9 +84,22 @@ public sealed class SourceBasedWriter
         // with the pushed-down content instead of clipping it. Runs AFTER the MCID
         // mover so both passes see a stable snapshot of /Contents.
         var pathByPage = GroupByPage(plan.PathBandOverlays, static o => o.Page, pageCount);
+        var decorByPage = GroupByPage(plan.DecorShiftOverlays, static o => o.Page, pageCount);
         foreach (var (page, list) in pathByPage)
         {
-            ContentStreamPathBandShifter.Apply(doc.GetPage(page), list);
+            decorByPage.TryGetValue(page, out var decors);
+            ContentStreamPathBandShifter.Apply(doc.GetPage(page), list, decors);
+        }
+
+        // ---- annotation shifts: Widget/Link annotations live on the page, not in
+        // /Contents, so the mover and path shifter never touch them — form fields stayed
+        // put while their blank lines were pushed down (PLATO p1). One overlay per shifted
+        // annotation-backed tree node, so unrelated annotations stay (UDO p2 TOC links).
+        // Diverges from Java, which leaves annotations behind — §9.
+        var annotByPage = GroupByPage(plan.AnnotShiftOverlays, static o => o.Page, pageCount);
+        foreach (var (page, list) in annotByPage)
+        {
+            ShiftMatchingAnnotations(doc.GetPage(page), list);
         }
 
         // ---- addParagraph overlays: stamp fresh tagged blocks --------------------------
@@ -123,6 +136,43 @@ public sealed class SourceBasedWriter
         // Sources sometimes emit widgets whose Form tag was never authored; wrap the
         // orphan in a fresh Form under the tree root so the checker is satisfied.
         OrphanWidgetTagger.ApplyAll(doc);
+    }
+
+    /// <summary>
+    /// Translate each page annotation whose /Rect overlaps a shifted annotation-backed
+    /// tree node's pre-shift bbox. An annotation moves at most once per write even when
+    /// several overlays cover it (an L subtree can contribute Form + parent bboxes).
+    /// </summary>
+    private static void ShiftMatchingAnnotations(PdfPage page, IReadOnlyList<AnnotShiftOverlay> overlays)
+    {
+        var annots = page.GetPdfObject().GetAsArray(PdfName.Annots);
+        if (annots is null) return;
+        var moved = new HashSet<int>();
+        foreach (var ov in overlays)
+        {
+            for (int i = 0; i < annots.Size(); i++)
+            {
+                if (moved.Contains(i)) continue;
+                if (annots.Get(i) is not PdfDictionary a) continue;
+                var rect = a.GetAsArray(PdfName.Rect);
+                if (rect is null || rect.Size() != 4) continue;
+                double x1 = rect.GetAsNumber(0)?.DoubleValue() ?? 0;
+                double y1 = rect.GetAsNumber(1)?.DoubleValue() ?? 0;
+                double x2 = rect.GetAsNumber(2)?.DoubleValue() ?? 0;
+                double y2 = rect.GetAsNumber(3)?.DoubleValue() ?? 0;
+                double cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+                const double slack = 2.0;
+                bool inside = cx > ov.X - slack && cx < ov.X + ov.Width + slack
+                    && cy > ov.Y - slack && cy < ov.Y + ov.Height + slack;
+                if (!inside) continue;
+                if (Math.Min(y1, y2) + ov.Dy < 0) continue;
+                rect.Set(1, new PdfNumber(y1 + ov.Dy));
+                rect.Set(3, new PdfNumber(y2 + ov.Dy));
+                rect.SetModified();
+                a.SetModified();
+                moved.Add(i);
+            }
+        }
     }
 
     /// <summary>

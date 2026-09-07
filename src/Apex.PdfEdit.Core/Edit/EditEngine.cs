@@ -115,6 +115,15 @@ public sealed class EditEngine
         var plan = EditPlan.NewBuilder();
         var applied = new List<string>();
         var issues = new List<EditIssue>();
+        // nodeId -> (page, ORIGINAL bbox, cumulative dy) across every push-down op — the
+        // writer pairs untagged decorations with their owner and moves them by exactly
+        // the owner's total dy (band composition overshot when op chains differed).
+        var decor = new Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)>();
+        // Deleted nodes leave their visual space EMPTY ("no pull-up") but still occupied —
+        // the box border/rule artifacts stay behind. Later adds must not land there
+        // (2026 Proxy p4: a paragraph appended after a delete sat on the deleted
+        // call-out box's border).
+        var tombstones = new List<(string Parent, int Page, double Y)>();
 
         foreach (var op in edits.Operations)
         {
@@ -126,13 +135,13 @@ public sealed class EditEngine
                         ApplySetText(s, byId, alignmentByNode, geom, nodesByPage, plan);
                         break;
                     case AddParagraphOp a:
-                        ApplyAddParagraph(a, doc, geom, byId, BuildChildrenByParent(doc), plan);
+                        ApplyAddParagraph(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor, tombstones);
                         break;
                     case AddListItemOp a:
-                        ApplyAddListItem(a, doc, geom, byId, BuildChildrenByParent(doc), plan);
+                        ApplyAddListItem(a, doc, geom, byId, BuildChildrenByParent(doc), plan, decor, tombstones);
                         break;
                     case DeleteNodeOp d:
-                        ApplyDeleteNode(d, doc, byId, BuildChildrenByParent(doc), plan);
+                        ApplyDeleteNode(d, doc, byId, BuildChildrenByParent(doc), plan, tombstones);
                         break;
                     default:
                         throw new InvalidOperationException("Unknown op type: " + op.GetType().Name);
@@ -146,6 +155,11 @@ public sealed class EditEngine
                 // propagate so bugs aren't silently hidden as per-op warnings.
                 issues.Add(new EditIssue(op.Id, op.Type, e.Message));
             }
+        }
+
+        foreach (var d in decor.Values)
+        {
+            plan.DecorShift(new DecorShiftOverlay(d.Page, d.X, d.Y, d.W, d.H, d.Dy));
         }
 
         return new EditResult(plan.Build(), applied, issues);
@@ -182,22 +196,7 @@ public sealed class EditEngine
             throw new ArgumentException($"target id={op.Target} has zero bbox; cannot stamp overlay");
         }
 
-        if (_fontResolver is not null)
-        {
-            var missing = _allowExtractedGlyphs
-                ? _fontResolver.FirstUnrenderableCodePointForOcrRaster(target.Page, target.Mcid, op.NewContent)
-                : _fontResolver.FirstUnrenderableCodePoint(target.Page, target.Mcid, op.NewContent);
-            if (missing is { } cp)
-            {
-                throw new ArgumentException(
-                    $"setText.newContent for target id={op.Target}" +
-                    $" needs character U+{cp.ToString("X4", CultureInfo.InvariantCulture)}" +
-                    $" ('{char.ConvertFromUtf32(cp)}'), which is not in the source PDF's embedded font subset for " +
-                    $"(page={target.Page}, mcid={target.Mcid}). " +
-                    "Restrict the edit to characters already used in the source, or extend " +
-                    "the source PDF's embedded font before re-running.");
-            }
-        }
+        CheckFontCoverage("setText.newContent", $"target id={op.Target}", target.Page, target.Mcid, op.NewContent);
 
         CheckPage(op.Page, target.Page, "setText", $"target id={target.Id}");
 
@@ -224,7 +223,70 @@ public sealed class EditEngine
             target.Mcid,
             glyphBaselineY,
             nextSiblingTopY,
-            sourceRuns));
+            sourceRuns,
+            SourceLineGap(geom, target.Page, target.Mcid)));
+    }
+
+    /// <summary>
+    /// Observed baseline-to-baseline gap of the source block's glyph lines, or 0 when the
+    /// block is single-line or the gaps are irregular. Lets the writer re-wrap multi-line
+    /// replacements at the SOURCE spacing instead of the font's natural leading (PLATO p1:
+    /// a double-spaced worksheet paragraph collapsed into tight lines).
+    /// </summary>
+    private static double SourceLineGap(GeometryJson? geom, int page, int mcid)
+    {
+        if (geom is null) return 0;
+        var ys = new List<double>();
+        foreach (var g in geom.GlyphsFor(page, mcid))
+        {
+            bool seen = false;
+            foreach (var y in ys)
+            {
+                if (Math.Abs(y - g.Y) < 1.0) { seen = true; break; }
+            }
+            if (!seen) ys.Add(g.Y);
+        }
+        if (ys.Count < 2) return 0;
+        ys.Sort();
+        ys.Reverse();
+        double first = ys[0] - ys[1];
+        double sum = 0;
+        for (int i = 1; i < ys.Count; i++)
+        {
+            double gap = ys[i - 1] - ys[i];
+            if (gap <= 0 || Math.Abs(gap - first) > 1.5) return 0;
+            sum += gap;
+        }
+        return sum / (ys.Count - 1);
+    }
+
+    /// <summary>
+    /// Annotation-backed tree nodes (form-field widgets, links) draw via page /Annots, not
+    /// /Contents — a push-down must translate their annotation /Rect alongside the moved
+    /// text. Emitted per shifted node (pre-shift bbox) so only annotations whose content
+    /// actually moved follow; a band-wide sweep dragged unrelated TOC links (UDO p2).
+    /// </summary>
+    private static void AccumulateDecorShift(
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor,
+        int page, TreeNode n, double shiftAmount)
+    {
+        if (n.Id is null || !HasBbox(n) || !HasMcid(n)) return;
+        if (decor.TryGetValue(n.Id, out var d))
+        {
+            decor[n.Id] = d with { Dy = d.Dy - shiftAmount };
+        }
+        else
+        {
+            // First shift of this node - n.Y is still its ORIGINAL (source-stream) position.
+            decor[n.Id] = (page, n.X, n.Y, n.Width, n.Height, -shiftAmount);
+        }
+    }
+
+    private static void EmitAnnotShiftIfAnnotBacked(EditPlan.Builder plan, int page, TreeNode n, double shiftAmount)
+    {
+        if (!HasBbox(n)) return;
+        if (n.Text is not ("Form" or "Link" or "Annot" or "Widget")) return;
+        plan.AnnotShift(new AnnotShiftOverlay(page, n.X, n.Y, n.Width, n.Height, -shiftAmount));
     }
 
     private static double NextSiblingTopBelow(Dictionary<int, List<TreeNode>> nodesByPage, TreeNode target)
@@ -252,7 +314,9 @@ public sealed class EditEngine
     private void ApplyAddParagraph(AddParagraphOp op, DocumentJson doc, GeometryJson? geom,
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
-        EditPlan.Builder plan)
+        EditPlan.Builder plan,
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor,
+        List<(string Parent, int Page, double Y)> tombstones)
     {
         if (string.IsNullOrWhiteSpace(op.Parent))
         {
@@ -337,6 +401,11 @@ public sealed class EditEngine
         var styleDonor = explicitDonor ?? tagTreeDonor ?? positionDonor;
         var style = ResolveStyle(styleDonor.Page, styleDonor.Mcid, op.Style?.Font);
 
+        // Font-subset pre-flight against the donor that ResolveStyle actually used —
+        // structural donors with mcid<0 are skipped (no font known), matching setText.
+        CheckFontCoverage("addParagraph.content", $"style donor id={styleDonor.Id}",
+            styleDonor.Page, styleDonor.Mcid, op.Content);
+
         int page = positionDonor.Page;
         CheckPage(op.Page, page, "addParagraph", $"position donor id={positionDonor.Id}");
         double x = positionDonor.X;
@@ -365,6 +434,15 @@ public sealed class EditEngine
             y = positionDonor.Y - paraGap - height;
             applyPushDown = false;
         }
+        // Vacated space from earlier deletes under the same parent stays reserved
+        // ("no pull-up") - its border/rule artifacts are still drawn there.
+        foreach (var t in tombstones)
+        {
+            if (string.Equals(t.Parent, op.Parent, StringComparison.Ordinal) && t.Page == page)
+            {
+                y = Math.Min(y, t.Y - paraGap - height);
+            }
+        }
         if (y < 0)
         {
             throw new ArgumentException(
@@ -375,7 +453,9 @@ public sealed class EditEngine
         var toShift = applyPushDown ? CollectShiftTargets(doc, childrenByParent, siblings, index, page) : new List<TreeNode>();
         toShift = ExcludeNodesAboveBand(toShift, y + height, geom, page);
         toShift = ExcludeNodesOutsideColumn(toShift, x, x + width, geom, page);
+        toShift = ExcludeSplitLists(toShift, byId, childrenByParent, y + height, null);
         toShift = PruneShiftChain(toShift, y, shiftAmount);
+        var keepOut = KeepOutRects(doc, page, toShift);
         foreach (var n in toShift)
         {
             if (HasBbox(n) && (n.Y - shiftAmount) < 0)
@@ -424,6 +504,8 @@ public sealed class EditEngine
 
         foreach (var n in toShift)
         {
+            EmitAnnotShiftIfAnnotBacked(plan, page, n, shiftAmount);
+            AccumulateDecorShift(decor, page, n, shiftAmount);
             if (HasBbox(n)) n.Y -= shiftAmount;
             if (HasMcid(n))
             {
@@ -433,14 +515,22 @@ public sealed class EditEngine
 
         ShiftOrphanGeometryMcids(doc, geom, page, y + height, toShift, shiftAmount, plan);
 
-        var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, x, x + width);
-        plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount, bandLeft, bandRight));
+        // No pushed-down content → no decoration shift. Emitting the band anyway drags
+        // full-width artifact rects (section header fills) down while their white text
+        // stays put (Bessemer p4). Diverges from Java like the exclusions above — §9.
+        if (toShift.Count > 0)
+        {
+            var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, x, x + width);
+            plan.PathBand(new PathBandOverlay(page, y + height, -shiftAmount, bandLeft, bandRight, keepOut));
+        }
     }
 
     private void ApplyAddListItem(AddListItemOp op, DocumentJson doc, GeometryJson? geom,
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
-        EditPlan.Builder plan)
+        EditPlan.Builder plan,
+        Dictionary<string, (int Page, double X, double Y, double W, double H, double Dy)> decor,
+        List<(string Parent, int Page, double Y)> tombstones)
     {
         if (string.IsNullOrWhiteSpace(op.Parent))
         {
@@ -528,6 +618,18 @@ public sealed class EditEngine
                 $"addListItem donor LI id={donorLi.Id} has no MCID-bearing descendant — writer can't locate the L container.");
         }
 
+        // Fall back to donorMcidLeaf when the specific column donor lacks its own MCID
+        // (e.g. structural Lbl with a leaf descendant carrying the mcid). Matches the
+        // font the writer will pick in AddListItemStamper.ResolveFontFor.
+        int lblFontMcid = HasMcid(donorLbl) ? donorLbl.Mcid : donorMcidLeaf.Mcid;
+        int lblFontPage = HasMcid(donorLbl) ? donorLbl.Page : donorMcidLeaf.Page;
+        int bodyFontMcid = HasMcid(donorLBody) ? donorLBody.Mcid : donorMcidLeaf.Mcid;
+        int bodyFontPage = HasMcid(donorLBody) ? donorLBody.Page : donorMcidLeaf.Page;
+        CheckFontCoverage("addListItem.labelText", $"donor Lbl id={donorLbl.Id}",
+            lblFontPage, lblFontMcid, op.LabelText);
+        CheckFontCoverage("addListItem.bodyText", $"donor LBody id={donorLBody.Id}",
+            bodyFontPage, bodyFontMcid, op.BodyText);
+
         var fontOverride = op.Style?.Font;
         var lblStyle = ResolveStyle(donorLbl.Page, donorLbl.Mcid, fontOverride);
         var bodyStyle = ResolveStyle(donorLBody.Page, donorLBody.Mcid, fontOverride);
@@ -563,6 +665,13 @@ public sealed class EditEngine
             }
             newY = prevBottom - listItemGap - height;
             applyPushDown = index < liSiblings.Count;
+        }
+        foreach (var t in tombstones)
+        {
+            if (string.Equals(t.Parent, op.Parent, StringComparison.Ordinal) && t.Page == page)
+            {
+                newY = Math.Min(newY, t.Y - listItemGap - height);
+            }
         }
         if (newY < 0)
         {
@@ -606,7 +715,9 @@ public sealed class EditEngine
         double columnLeft = Math.Min(donorLbl.X, donorLBody.X);
         double columnRight = Math.Max(donorLbl.X + donorLbl.Width, donorLBody.X + donorLBody.Width);
         toShift = ExcludeNodesOutsideColumn(toShift, columnLeft, columnRight, geom, page);
+        toShift = ExcludeSplitLists(toShift, byId, childrenByParent, newY + height, listParent.Id);
         toShift = PruneShiftChain(toShift, newY, shiftAmount);
+        var keepOut = KeepOutRects(doc, page, toShift);
 
         foreach (var n in toShift)
         {
@@ -660,6 +771,8 @@ public sealed class EditEngine
 
         foreach (var n in toShift)
         {
+            EmitAnnotShiftIfAnnotBacked(plan, page, n, shiftAmount);
+            AccumulateDecorShift(decor, page, n, shiftAmount);
             if (HasBbox(n)) n.Y -= shiftAmount;
             if (HasMcid(n))
             {
@@ -669,8 +782,58 @@ public sealed class EditEngine
 
         ShiftOrphanGeometryMcids(doc, geom, page, newY + height, toShift, shiftAmount, plan);
 
-        var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, columnLeft, columnRight);
-        plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount, bandLeft, bandRight));
+        // See ApplyAddParagraph: an empty shift chain must not emit a path band.
+        if (toShift.Count > 0)
+        {
+            var (bandLeft, bandRight) = ComputeBandSpan(toShift, geom, page, columnLeft, columnRight);
+            plan.PathBand(new PathBandOverlay(page, newY + height, -shiftAmount, bandLeft, bandRight, keepOut));
+        }
+    }
+
+    /// <summary>
+    /// Bboxes of every LEAF node on the page whose text is NOT moving (not in the final
+    /// shift chain) — the path band must not sweep their decorations. Covers both nodes
+    /// the exclusion passes dropped AND nodes that precede the insertion in reading order
+    /// but sit below the band geometrically (UDO p2: left-column TOC link underlines).
+    /// </summary>
+    private static List<KeepOutRect> KeepOutRects(DocumentJson doc, int page, List<TreeNode> kept)
+    {
+        var keptIds = new HashSet<string>();
+        foreach (var n in kept)
+        {
+            if (n.Id is not null) keptIds.Add(n.Id);
+        }
+        var shiftedBoxes = new List<KeepOutRect>();
+        foreach (var n in kept)
+        {
+            if (HasBbox(n)) shiftedBoxes.Add(new KeepOutRect(n.X, n.Y, n.Width, n.Height));
+        }
+
+        var keepOut = new List<KeepOutRect>();
+        foreach (var n in doc.Tree)
+        {
+            if (n.Page != page || !HasBbox(n) || !HasMcid(n)) continue;
+            if (n.Id is not null && keptIds.Contains(n.Id)) continue;
+            // A non-shifted node riding INSIDE a shifted one (a Link inside a pushed-down P)
+            // must not veto the move — its decorations belong to the moving text
+            // (form-40x p2: a link underline stranded mid-paragraph as a strikethrough).
+            // FULL containment only: a mere centre overlap with a wide shifted paragraph
+            // dropped an unshifted heading's keep-out and its pill background moved alone.
+            const double slack = 2.0;
+            bool insideShifted = false;
+            foreach (var s in shiftedBoxes)
+            {
+                if (n.X >= s.X - slack && n.X + n.Width <= s.X + s.Width + slack
+                    && n.Y >= s.Y - slack && n.Y + n.Height <= s.Y + s.Height + slack)
+                {
+                    insideShifted = true;
+                    break;
+                }
+            }
+            if (insideShifted) continue;
+            keepOut.Add(new KeepOutRect(n.X, n.Y, n.Width, n.Height));
+        }
+        return keepOut;
     }
 
     private List<TreeNode> CollectShiftTargetsFromRoots(DocumentJson doc,
@@ -762,7 +925,8 @@ public sealed class EditEngine
     private void ApplyDeleteNode(DeleteNodeOp op, DocumentJson doc,
         Dictionary<string, TreeNode> byId,
         Dictionary<string, List<TreeNode>> childrenByParent,
-        EditPlan.Builder plan)
+        EditPlan.Builder plan,
+        List<(string Parent, int Page, double Y)> tombstones)
     {
         if (string.IsNullOrWhiteSpace(op.Target))
         {
@@ -805,6 +969,10 @@ public sealed class EditEngine
 
         plan.Delete(new DeleteOverlay(target.Page, target.Mcid, op.Target,
             target.X, target.Y, target.Width, target.Height));
+        if (target.Parent is { } tp && HasBbox(target))
+        {
+            tombstones.Add((tp, target.Page, target.Y));
+        }
         doc.Tree.Remove(target);
         byId.Remove(op.Target);
     }
@@ -917,11 +1085,15 @@ public sealed class EditEngine
 
     private static bool HasMcid(TreeNode? n) => n is not null && n.Mcid >= 0;
 
+    // Sub-point overlaps are extraction noise, not visual collisions - a donor Lbl/LBody
+    // pair 0.25pt apart tripped the new-node check (ImplementationGuidelines p11).
+    private const double OverlapTolerancePt = 1.0;
+
     private static bool XOverlap(double x1, double w1, double x2, double w2)
-        => Math.Max(x1, x2) < Math.Min(x1 + w1, x2 + w2);
+        => Math.Max(x1, x2) < Math.Min(x1 + w1, x2 + w2) - OverlapTolerancePt;
 
     private static bool YOverlap(double y1, double h1, double y2, double h2)
-        => Math.Max(y1, y2) < Math.Min(y1 + h1, y2 + h2);
+        => Math.Max(y1, y2) < Math.Min(y1 + h1, y2 + h2) - OverlapTolerancePt;
 
     private readonly record struct Bbox(double X, double Y, double W, double H);
 
@@ -1178,6 +1350,80 @@ public sealed class EditEngine
     private static List<TreeNode> ExcludeNodesOutsideColumn(List<TreeNode> toShift,
         double columnLeft, double columnRight, GeometryJson? geom, int page)
     {
+        return ExcludeNodesOutsideColumnCore(toShift, columnLeft, columnRight, geom, page);
+    }
+
+    /// <summary>
+    /// Drop shift candidates whose nearest L/List ancestor also has visible items that are
+    /// NOT shifting (typically excluded as above-band): shifting only the tail items tears
+    /// the list apart (form-40x p2: a left-column append split the mid-column bullet list —
+    /// "Give/Call" stayed while "Respond" moved down, leaving a gap and later collisions).
+    /// The op's own target list is exempt — mid-list inserts legitimately move later items.
+    /// </summary>
+    private static List<TreeNode> ExcludeSplitLists(List<TreeNode> toShift,
+        Dictionary<string, TreeNode> byId,
+        Dictionary<string, List<TreeNode>> childrenByParent,
+        double bandTopY, string? exemptListId)
+    {
+        if (toShift.Count == 0) return toShift;
+        var shiftIds = new HashSet<string>();
+        foreach (var n in toShift)
+        {
+            if (n.Id is not null) shiftIds.Add(n.Id);
+        }
+
+        string? NearestList(TreeNode n)
+        {
+            var cur = n;
+            while (cur.Parent is { } pid && byId.TryGetValue(pid, out var p))
+            {
+                if (p.Text is "L" or "List") return p.Id;
+                cur = p;
+            }
+            return null;
+        }
+
+        bool ListIsSplit(string listId)
+        {
+            var stack = new Stack<TreeNode>(ChildrenOf(childrenByParent, listId));
+            while (stack.Count > 0)
+            {
+                var c = stack.Pop();
+                bool visible = HasBbox(c) && HasMcid(c);
+                if (visible && (c.Id is null || !shiftIds.Contains(c.Id)))
+                {
+                    return true;
+                }
+                if (c.Id is not null)
+                {
+                    foreach (var g in ChildrenOf(childrenByParent, c.Id)) stack.Push(g);
+                }
+            }
+            return false;
+        }
+
+        var splitCache = new Dictionary<string, bool>();
+        var result = new List<TreeNode>();
+        foreach (var n in toShift)
+        {
+            var listId = NearestList(n);
+            if (listId is not null && !string.Equals(listId, exemptListId, StringComparison.Ordinal))
+            {
+                if (!splitCache.TryGetValue(listId, out bool split))
+                {
+                    split = ListIsSplit(listId);
+                    splitCache[listId] = split;
+                }
+                if (split) continue;
+            }
+            result.Add(n);
+        }
+        return result;
+    }
+
+    private static List<TreeNode> ExcludeNodesOutsideColumnCore(List<TreeNode> toShift,
+        double columnLeft, double columnRight, GeometryJson? geom, int page)
+    {
         // Column membership is TRANSITIVE: a wide paragraph overlapping the donor column
         // (form-40x p2: a P spanning x 144-487 next to a 216-396 list) pulls its own
         // horizontal neighbours into the shift — excluding them leaves interlocked rows
@@ -1365,6 +1611,83 @@ public sealed class EditEngine
                 $"{opName}.page={p} does not match the resolved page {resolvedPage} (from {source})." +
                 " Remove the page field or correct it to match.");
         }
+    }
+
+    /// <summary>
+    /// Pre-flight guard shared by setText, addParagraph, and addListItem. Rejects
+    /// text ONLY when neither the source PDF's embedded font subset at (page, mcid)
+    /// NOR the writer's guaranteed-embedded system fallback (Arial-family via
+    /// <see cref="SystemFontLocator.LoadUniversalFallback"/>) can render some
+    /// character in <paramref name="text"/>.
+    ///
+    /// When the source subset misses a char but the fallback covers it, the writer's
+    /// per-char <see cref="MultiFontLineEmitter"/> picks the fallback for that char
+    /// — the op proceeds. A structured log line records the mixed-face rendering
+    /// so the operator can trace visual font swaps.
+    ///
+    /// History: P1 (2026-09-04) rejected any source-subset miss to stop the silent
+    /// drop the customer reported. P2 relaxes the reject once we know the writer
+    /// has a real fallback — accepting the customer's addListItem now works end
+    /// to end even for chars like 'X'/'Y'/brackets/braces that aren't in the source
+    /// subset for a typical prose LBody.
+    ///
+    /// No-op when the resolver is unset, the mcid is negative (no known font), or
+    /// the text is empty.
+    /// </summary>
+    private void CheckFontCoverage(string opField, string subjectLabel, int page, int mcid, string? text)
+    {
+        if (_fontResolver is null) return;
+        if (string.IsNullOrEmpty(text)) return;
+        if (mcid < 0) return;
+        var missing = _allowExtractedGlyphs
+            ? _fontResolver.FirstUnrenderableCodePointForOcrRaster(page, mcid, text)
+            : _fontResolver.FirstUnrenderableCodePoint(page, mcid, text);
+        if (missing is not { } cp) return;
+
+        var style = _fontResolver.Resolve(page, mcid);
+        var fallbackMiss = FirstFallbackMiss(style, text);
+        if (fallbackMiss is null)
+        {
+            _log.LogWarning(
+                "{OpField} for {Subject}: char U+{Cp:X4} ('{Char}') not in source subset " +
+                "(page={Page}, mcid={Mcid}); writer will emit via embedded system fallback (mixed-face rendering).",
+                opField, subjectLabel, cp, char.ConvertFromUtf32(cp), page, mcid);
+            return;
+        }
+        int hardMissCp = fallbackMiss.Value;
+        throw new ArgumentException(
+            $"{opField} for {subjectLabel}" +
+            $" needs character U+{hardMissCp.ToString("X4", CultureInfo.InvariantCulture)}" +
+            $" ('{char.ConvertFromUtf32(hardMissCp)}'), which neither the source PDF's embedded font subset for " +
+            $"(page={page}, mcid={mcid}) nor the writer's embedded system fallback can render. " +
+            "Restrict the edit to characters covered by an installed system font family, or extend " +
+            "the source PDF's embedded font before re-running.");
+    }
+
+    /// <summary>
+    /// First code point in <paramref name="text"/> that the writer's system fallback
+    /// (same face family the AddListItemStamper / AddParagraphStamper / ContentStreamMcidReplacer
+    /// pick when the source subset misses a char) can't render — or null when the
+    /// fallback covers everything. Loading the fallback is cheap (metadata-only read
+    /// of the on-disk TTF).
+    /// </summary>
+    private static int? FirstFallbackMiss(FontStyle? style, string text)
+    {
+        var fallback = SystemFontLocator.LoadUniversalFallback(style);
+        if (fallback is null)
+        {
+            // No system font present — treat every char as a hard miss so the pre-flight
+            // still fails loud rather than letting the writer land on non-embedded stdlib.
+            for (int i = 0; i < text.Length;)
+            {
+                int cp = char.ConvertToUtf32(text, i);
+                if (cp != '\n' && cp != '\r' && cp != '\t') return cp;
+                i += char.IsHighSurrogate(text[i]) ? 2 : 1;
+            }
+            return null;
+        }
+        int miss = PageFontInventory.FirstMissingCodePoint(fallback, text);
+        return miss >= 0 ? miss : null;
     }
 
     private FontStyle ResolveStyle(int page, int mcid)
