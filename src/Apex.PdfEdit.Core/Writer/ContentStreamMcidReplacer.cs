@@ -732,22 +732,22 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         // Fresh dot leader between title-end (+ breathing gap) and pagenum-start
         // (- breathing gap). Skip when the title already overruns the pagenum slot.
+        // Emitted as plain "." repeated at natural glyph advance so the pitch matches
+        // the source's dense leader (Ram TOC ~2.8pt pitch); with ". " units the leader
+        // came out at 5.5pt pitch and looked visibly sparser than unedited rows.
         const float LeaderGap = 4.0f;
-        const string DotUnit = ". ";
         float leaderStart = leftX + titleWidth + LeaderGap;
         float leaderEnd = pagenumX - LeaderGap;
         if (leaderEnd > leaderStart)
         {
-            float unitWidth = font.GetWidth(DotUnit, fontSize);
-            if (unitWidth > 0.1f)
+            float dotWidth = font.GetWidth(".", fontSize);
+            if (dotWidth > 0.1f)
             {
-                int nUnits = (int)((leaderEnd - leaderStart) / unitWidth);
-                if (nUnits > 0)
+                int nDots = (int)((leaderEnd - leaderStart) / dotWidth);
+                if (nDots > 0)
                 {
-                    var leader = new StringBuilder(nUnits * DotUnit.Length);
-                    for (int i = 0; i < nUnits; i++) leader.Append(DotUnit);
                     _outCanvas.SetTextMatrix(leaderStart, baselineY);
-                    _outCanvas.ShowText(leader.ToString());
+                    _outCanvas.ShowText(new string('.', nDots));
                 }
             }
         }
