@@ -67,6 +67,10 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
     private int _activeTargetMcid = -1;
     private bool _replacementEmittedForActiveBlock;
+    // Tag name (without leading '/') of the currently open target BDC. Used by the
+    // TJ→Tc fold guard so headings and table headers don't inherit a folded Tc that
+    // Adobe would surface as a non-zero AV in the Format panel.
+    private string? _activeTargetTag;
     private bool _insideTextObject;
 
     // Snapshots of the most recent Tf/Tm/TL passed-through operator sequences. Re-emitted
@@ -306,6 +310,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             if (_activeTargetMcid < 0 && _byMcid.ContainsKey(mcid))
             {
                 _activeTargetMcid = mcid;
+                _activeTargetTag = operands[0] is PdfName tn ? tn.GetValue() : null;
                 _replacementEmittedForActiveBlock = false;
                 // Snapshot inherited Tc/Tw at BDC entry.
                 _tcAtBdcOpen = _lastTcOperands is null ? null : new List<PdfObject>(_lastTcOperands);
@@ -334,6 +339,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 _replacementEmittedForActiveBlock = true;
             }
             _activeTargetMcid = -1;
+            _activeTargetTag = null;
             // Clear per-block first-* so subsequent target MCIDs capture their own state fresh.
             _firstTcInBlock = null;
             _firstTwInBlock = null;
@@ -566,9 +572,20 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             && lines.Count > 1
             && bboxWidth > 0;
 
-        // Fold source's per-glyph TJ kerning into an equivalent Tc — unless we're about to
-        // Tw-justify, in which case the fold is a false positive.
-        if (!justifyLines
+        // For heading / table-header tags, force Tc=0 so Adobe's Format panel reads
+        // AV=0 on the modified text — option-b, 2026-09-08. Some sources open the H*
+        // BDC with a small non-zero Tc (e.g. Ram MCID 26 → -0.0182 Tc used only for the
+        // leading digit) and continue with TJ-array kerning for the rest; propagating
+        // either bumps the visible AV. Total glyph-advance delta of zeroing on a heading
+        // is <0.5pt — imperceptible.
+        if (IsHeadingOrHeaderTag(_activeTargetTag))
+        {
+            emitTcOperands = new List<PdfObject> { new PdfNumber(0), new PdfLiteral("Tc") };
+        }
+        // Fold source's per-glyph TJ kerning into an equivalent Tc — unless we're about
+        // to Tw-justify (multi-line justified, false positive) OR we already forced Tc=0
+        // above for a heading.
+        else if (!justifyLines
             && _firstTjAvgKernPer1000 is { } avgKern
             && Math.Abs(avgKern) > 0.01
             && emitTcOperands is not null)
@@ -1101,6 +1118,18 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
     private static bool IsTextShowingOp(string name)
         => name == "Tj" || name == "TJ" || name == "'" || name == "\"";
+
+    /// <summary>
+    /// True for the PDF structure tags whose modified text should NOT inherit a folded
+    /// TJ→Tc value (H1–H6, TH). Called from the fold guard in EmitReplacement.
+    /// </summary>
+    internal static bool IsHeadingOrHeaderTag(string? tag)
+    {
+        if (string.IsNullOrEmpty(tag)) return false;
+        if (tag == "TH") return true;
+        if (tag.Length == 2 && tag[0] == 'H' && tag[1] >= '1' && tag[1] <= '6') return true;
+        return false;
+    }
 
     /// <summary>First numeric operand as a double, or 0.0 on null/empty/non-number.</summary>
     private static double NumFromOperands(IList<PdfObject>? operands)

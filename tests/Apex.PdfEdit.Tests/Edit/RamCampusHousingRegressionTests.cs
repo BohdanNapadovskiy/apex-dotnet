@@ -187,6 +187,24 @@ public sealed class RamCampusHousingRegressionTests
     }
 
     [FactIfSample(RamPdf)]
+    public void EditedHeadingKeepsAvZero()
+    {
+        // Option-b (2026-09-08): H*/TH targets must emit Tc=0 at glyph-draw time so
+        // Adobe's Format panel reads AV=0.00 on the modified heading. Pre-fix, node 118
+        // (H3) inherited the source's opening -0.0182 Tc and Adobe showed AV=-0.02.
+        var bytes = RunPipeline();
+        using var reader = new PdfReader(new MemoryStream(bytes));
+        using var pdf = new PdfDocument(reader);
+
+        // Node 118 is on page 3, MCID 26, tag H3 — one of the four headings the
+        // customer's edits.json modifies. Verifying it here covers every H*/TH edit
+        // in the batch (they share one code path in EmitReplacement).
+        double tc = ActiveTcAtFirstDraw(pdf, page: 3, mcid: 26);
+        tc.Should().Be(0.0,
+            "H3 target 118 should emit Tc=0 so Adobe's Format panel reads AV=0.00");
+    }
+
+    [FactIfSample(RamPdf)]
     public void ModifiedHeadingStaysAtSourcePosition()
     {
         // Node 215 ("3.4 Deposits and initial payments") sits below a table on page 5.
@@ -248,6 +266,35 @@ public sealed class RamCampusHousingRegressionTests
         throw new Xunit.Sdk.XunitException(
             "expected to find '" + needle + "' on page " + page +
             " but no baseline line contained it");
+    }
+
+    /// <summary>
+    /// Return the character-spacing (Tc) in effect when the first glyph inside the given
+    /// MCID gets drawn — this is what Adobe's Format panel reads back as "AV". Parses
+    /// the raw content stream because iText's TextRenderInfo doesn't expose Tc.
+    /// </summary>
+    private static double ActiveTcAtFirstDraw(PdfDocument pdf, int page, int mcid)
+    {
+        var contents = pdf.GetPage(page).GetContentBytes();
+        var raw = System.Text.Encoding.Latin1.GetString(contents);
+        var bdc = System.Text.RegularExpressions.Regex.Match(raw,
+            @"/MCID\s+" + mcid + @"\s*>>\s*BDC");
+        if (!bdc.Success)
+        {
+            throw new Xunit.Sdk.XunitException(
+                "MCID " + mcid + " BDC not found on page " + page);
+        }
+        int emcAt = raw.IndexOf("EMC", bdc.Index, StringComparison.Ordinal);
+        var block = raw.Substring(bdc.Index, emcAt - bdc.Index);
+        int firstTj = System.Text.RegularExpressions.Regex.Match(block, @"\bT[jJ]\b").Index;
+        var pre = firstTj > 0 ? block.Substring(0, firstTj) : block;
+        double last = 0.0; // PDF spec: initial Tc is 0
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(pre, @"(-?\d+\.?\d*)\s+Tc\b"))
+        {
+            last = double.Parse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        return last;
     }
 
     /// <summary>

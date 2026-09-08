@@ -289,6 +289,31 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
             .Should().Be(0.25);
     }
 
+    // isHeadingOrHeaderTag
+
+    [Theory]
+    [InlineData("H1", true)]
+    [InlineData("H2", true)]
+    [InlineData("H3", true)]
+    [InlineData("H4", true)]
+    [InlineData("H5", true)]
+    [InlineData("H6", true)]
+    [InlineData("TH", true)]
+    [InlineData("P", false)]
+    [InlineData("Note", false)]
+    [InlineData("Link", false)]
+    [InlineData("LBody", false)]
+    [InlineData("TD", false)]          // table data cell — not TH
+    [InlineData("Hx", false)]          // invalid heading level
+    [InlineData("H", false)]           // just 'H'
+    [InlineData("H12", false)]         // > 6
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsHeadingOrHeaderTagRecognisesTheExpectedShapes(string? tag, bool expected)
+    {
+        ContentStreamMcidReplacer.IsHeadingOrHeaderTag(tag).Should().Be(expected);
+    }
+
     private static IList<PdfObject> TfOps(string fontName, double size)
         => new List<PdfObject> { new PdfName(fontName), new PdfNumber(size) };
 
