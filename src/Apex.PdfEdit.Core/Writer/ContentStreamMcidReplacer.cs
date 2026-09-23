@@ -521,18 +521,15 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             lines = new List<string> { overlay.NewContent };
         }
 
-        // Multi-line overflow: collapse to single line if vertical doesn't fit above next sibling.
-        if (lines.Count > 1)
+        // Multi-line overflow: collapse to single line if vertical doesn't fit above next
+        // sibling. When there IS no sibling below on the page (NaN), we do NOT cap line
+        // count — the last block on a page is free to grow downward into the margin
+        // (Feedback 1.1 TCC page 3: doubled paragraph at the bottom of the page has no
+        // next sibling; capping by the source's own bbox height collapsed a wrapped
+        // multi-line replacement into a single line that ran under the adjacent image).
+        if (lines.Count > 1 && double.IsFinite(overlay.NextSiblingTopY))
         {
-            float availableDescent;
-            if (double.IsFinite(overlay.NextSiblingTopY))
-            {
-                availableDescent = (float)(baselineY - overlay.NextSiblingTopY) + SiblingOvershootTolerancePt;
-            }
-            else
-            {
-                availableDescent = bboxHeight - lineHeight;
-            }
+            float availableDescent = (float)(baselineY - overlay.NextSiblingTopY) + SiblingOvershootTolerancePt;
             int maxLinesThatFit = 1 + (int)Math.Floor(availableDescent / lineHeight);
             if (lines.Count > maxLinesThatFit)
             {

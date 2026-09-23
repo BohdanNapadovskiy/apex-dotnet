@@ -6,6 +6,8 @@ using Apex.PdfEdit.Core.Writer;
 using FluentAssertions;
 using iText.Kernel.Pdf;
 using iText.Kernel.Pdf.Canvas.Parser;
+using iText.Kernel.Pdf.Canvas.Parser.Data;
+using iText.Kernel.Pdf.Canvas.Parser.Listener;
 using Xunit;
 
 namespace Apex.PdfEdit.Tests.Edit;
@@ -364,6 +366,160 @@ public sealed class CustomerFeedbackRegressionTests
             page5Text.Should().Contain(glyph,
                 $"customer's screenshot showed '{glyph}' silently dropped pre-P2");
         }
+    }
+
+    /// <summary>
+    /// Feedback 1.1 (2026-09-23) — customer POST /edit against the TCC handbook flagged
+    /// two writer regressions on paragraphs whose replacement wraps to more than one line:
+    /// <list type="number">
+    ///   <item><b>Page 3 (node 135)</b> — a doubled-content edit collapsed onto a single
+    ///       line that ran under the adjacent river photo, instead of preserving the
+    ///       source paragraph's line breaks. Root cause: the overflow guard capped
+    ///       <c>maxLinesThatFit</c> using the source bbox height even when NO next
+    ///       sibling existed on the page (the paragraph was at the page bottom), so a
+    ///       longer edit got squashed to one line rather than allowed to grow downward.</item>
+    ///   <item><b>Page 4 (node 139)</b> — a long-string edit rendered two wrapped lines
+    ///       on top of each other, only 2.22pt apart. Root cause: <c>SourceLineGap</c>
+    ///       clustered glyph Ys using a 1pt tolerance, so bold-italic "illicit discharge"
+    ///       (Y=517.3 with a taller bbox) read as a separate baseline from the surrounding
+    ///       regular text (Y=519.5) and the writer treated 2.22pt as the block's leading.</item>
+    /// </list>
+    /// Both are guarded here: the test drives the customer's exact edits.json against
+    /// the TCC handbook and asserts (a) the wrapped edit on page 3 emits multiple
+    /// distinct baselines with body-leading spacing, and (b) the wrapped edit on page 4
+    /// emits baselines separated by at least a full line-height (~12pt+), never <5pt.
+    /// </summary>
+    [FactIfSample(HandbookPdf)]
+    public void FeedbackV11WrappedEditsUseFullLeadingNotBboxDrift()
+    {
+        var pdfPath = TestSamples.Resolve(HandbookPdf);
+        var docPath = TestSamples.Resolve(HandbookDoc);
+        var geomPath = TestSamples.Resolve(HandbookGeom);
+        var doc = DocumentJsonLoader.Load(docPath);
+        var geom = GeometryJsonLoader.Load(geomPath);
+
+        // Customer's exact edits.json from Feedback Ver 1.1/SampleFiles.zip — the two
+        // setTexts that reproduced the reported issues. Kept inline verbatim.
+        var edits = new EditsJson
+        {
+            SchemaVersion = "1",
+            BaseDocument = Path.GetFileName(HandbookDoc),
+            Operations =
+            {
+                SetTextOp.Of("tcc-p2-setText", "135",
+                    "This Handbook shall serve as the guiding document for TCC staff engaged in any activity on TCC campuses that could potentially impact water quality. This Handbook shall serve as the guiding document for TCC staff engaged in any activity on TCC campuses that could potentially impact water quality."),
+                SetTextOp.Of("tcc-p4-setText", "139",
+                    "edit: the text QWERTYUIOPASDFGHJKLZXCVBNM[]{}1234567890 :"),
+            }
+        };
+
+        var outBuf = new MemoryStream();
+        using (var resolver = new SourcePdfFontResolver(pdfPath))
+        {
+            var result = new EditEngine(resolver).Apply(doc, geom, edits);
+            result.Issues.Should().BeEmpty();
+            result.AppliedOpIds.Should().BeEquivalentTo(new[] { "tcc-p2-setText", "tcc-p4-setText" });
+            new SourceBasedWriter(pdfPath).Write(result.Plan, outBuf);
+        }
+
+        var debug = Path.Combine(TestOutputs.ForDiagnostic(HandbookDir),
+            HandbookDir + "_feedback_v11_edit.pdf");
+        File.WriteAllBytes(debug, outBuf.ToArray());
+
+        using var reader = new PdfReader(new MemoryStream(outBuf.ToArray()));
+        using var pdf = new PdfDocument(reader);
+
+        // --- Page 3, node 135: wrapped-line preservation ---
+        // Every emitted baseline that carries part of "This Handbook shall serve as the
+        // guiding document". Pre-fix there was only ONE such baseline (all text collapsed
+        // to a single line). Post-fix the doubled sentence wraps to 3+ lines.
+        var handbookBaselines = CollectBaselinesContaining(pdf, page: 3, phrase: "guiding document");
+        handbookBaselines.Should().HaveCountGreaterThan(1,
+            "Feedback 1.1 page 3: doubled paragraph must wrap to multiple lines, not collapse under the image");
+
+        // Distinct-baseline gap between wrapped lines must be a real body leading
+        // (~20pt at 12pt body). Pre-fix collapse produced ONE baseline; if a future
+        // change re-introduces a small-gap stack, this catches it too.
+        handbookBaselines.Sort();
+        for (int i = 1; i < handbookBaselines.Count; i++)
+        {
+            double gap = handbookBaselines[i] - handbookBaselines[i - 1];
+            gap.Should().BeGreaterThan(10.0,
+                $"page 3 wrapped baselines must be at least a full line-height apart (gap {gap:F2}pt at Y {handbookBaselines[i]:F2})");
+        }
+
+        // --- Page 4, node 139: no 2.22pt intra-line stack ---
+        // Baselines carrying the customer's replacement. Pre-fix, "edit: the text" and
+        // "QWERTYUIOP..." landed on baselines 2.22pt apart (SourceLineGap treated the
+        // bold-italic run's bigger bbox as a distinct line). Post-fix wrapped lines
+        // sit at least one full font-height apart.
+        var illicitBaselines = CollectBaselinesContaining(pdf, page: 4, phrase: "QWERT");
+        illicitBaselines.Should().NotBeEmpty("page 4 replacement text must render");
+        var editBaselines = CollectBaselinesContaining(pdf, page: 4, phrase: "edit: the");
+        editBaselines.Should().NotBeEmpty("page 4 replacement text must render");
+
+        // The "edit: the text" baseline and the "QWERT..." baseline are either the SAME
+        // baseline (single-line rendering) OR separated by a full leading. A tiny 2-3pt
+        // separation is the exact regression the fix targets.
+        foreach (var eb in editBaselines)
+        {
+            foreach (var qb in illicitBaselines)
+            {
+                if (Math.Abs(eb - qb) < 0.1) continue;   // same baseline — fine
+                Math.Abs(eb - qb).Should().BeGreaterThan(6.0,
+                    $"page 4 wrapped lines must not stack at bbox-descender drift " +
+                    $"(edit-baseline {eb:F2}, QWERT-baseline {qb:F2}, gap {Math.Abs(eb - qb):F2}pt — pre-fix was 2.22pt)");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Return the sorted distinct baseline Ys of any text chunks that contain
+    /// <paramref name="phrase"/> as an infix. Baselines are bucketed at 0.5pt to
+    /// coalesce iText's per-glyph baseline reports back into visual lines.
+    /// </summary>
+    private static List<double> CollectBaselinesContaining(PdfDocument pdf, int page, string phrase)
+    {
+        var chunksByY = new SortedDictionary<int, List<(double X, double Y, string Text)>>();
+        var listener = new PhraseBaselineListener((tri, y, x, text) =>
+        {
+            int bucket = (int)Math.Round(y * 2);   // 0.5pt buckets
+            if (!chunksByY.TryGetValue(bucket, out var list))
+            {
+                list = new List<(double, double, string)>();
+                chunksByY[bucket] = list;
+            }
+            list.Add((x, y, text));
+        });
+        new PdfCanvasProcessor(listener).ProcessPageContent(pdf.GetPage(page));
+
+        var hits = new List<double>();
+        foreach (var list in chunksByY.Values)
+        {
+            list.Sort((a, b) => a.X.CompareTo(b.X));
+            var joined = string.Concat(list.Select(t => t.Text));
+            if (joined.Contains(phrase, StringComparison.Ordinal))
+            {
+                hits.Add(list[0].Y);
+            }
+        }
+        return hits;
+    }
+
+    private sealed class PhraseBaselineListener : IEventListener
+    {
+        private static readonly ICollection<EventType> Supported = new HashSet<EventType> { EventType.RENDER_TEXT };
+        private readonly Action<TextRenderInfo, double, double, string> _onText;
+        public PhraseBaselineListener(Action<TextRenderInfo, double, double, string> onText) { _onText = onText; }
+        public void EventOccurred(IEventData data, EventType type)
+        {
+            if (type != EventType.RENDER_TEXT || data is not TextRenderInfo tri) return;
+            var s = tri.GetText();
+            if (string.IsNullOrEmpty(s)) return;
+            var start = tri.GetBaseline().GetStartPoint();
+            _onText(tri, start.Get(1), start.Get(0), s);
+        }
+        public ICollection<EventType> GetSupportedEvents() => Supported;
     }
 
     /// <summary>
