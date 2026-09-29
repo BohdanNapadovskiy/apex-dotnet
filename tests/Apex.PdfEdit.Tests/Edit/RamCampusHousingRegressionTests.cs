@@ -228,6 +228,123 @@ public sealed class RamCampusHousingRegressionTests
             $"H3 baseline must stay near the source position (source={sourceY} edited={editedY})");
     }
 
+    [FactIfSample(RamPdf)]
+    public void NoteParagraphFirstLineKeepsIndentPastLabel()
+    {
+        // Customer feedback (2026-09-29): node 8 is a P.Note paragraph whose leading `*`
+        // marker sits at X=84.984 (its own Lbl MCID) with the paragraph text starting at
+        // X=88.485 on line 1 (subsequent lines return to X=84.984). Pre-fix the writer
+        // read node.X (the union bbox min = 84.984) and painted line 1 at 84.984 — the
+        // paragraph's opening 'A' collided with the source's `*` glyph. Post-fix line 1
+        // uses boxes[0].X (~88.485) so the indent is preserved.
+        var bytes = RunPipeline();
+        using var reader = new PdfReader(new MemoryStream(bytes));
+        using var pdf = new PdfDocument(reader);
+
+        double firstLineX = NoteParagraphFirstLineStartX(pdf);
+        firstLineX.Should().BeApproximately(88.485, 1.0,
+            "line 1 of the *Although… Note paragraph must start past the leading `*` label");
+    }
+
+    [FactIfSample(RamPdf)]
+    public void NoteParagraphFirstGlyphRendersInItalicFont()
+    {
+        // Customer feedback (2026-09-29): the italic Note paragraph's opening 'A' was
+        // being emitted in the roman Arial twin because PageFontInventory ran its
+        // rendered-chars scan AFTER the target page's content had been replaced with
+        // an empty stream — chars only used on that page (italic 'A' etc.) vanished
+        // from the scan and CanRenderStrict downgraded them to the pool fallback.
+        // Post-fix the scan runs before erasure so italic 'A' stays italic.
+        var bytes = RunPipeline();
+        using var reader = new PdfReader(new MemoryStream(bytes));
+        using var pdf = new PdfDocument(reader);
+
+        string firstGlyphFont = NoteParagraphFirstGlyphFontName(pdf);
+        firstGlyphFont.Should().Contain("Italic",
+            "the *Although… paragraph's opening 'A' must render in the italic Arial subset, not the roman twin");
+    }
+
+    /// <summary>
+    /// Start-X of the Note paragraph's own line 0 (identified by the distinctive substring
+    /// "lthough"). Filters out the sibling <c>*</c> Lbl glyph that renders at the same
+    /// baseline Y but belongs to a different MCID — using the leftmost render on the line
+    /// would return the label's X, not the paragraph's.
+    /// </summary>
+    private static double NoteParagraphFirstLineStartX(PdfDocument pdf)
+    {
+        var byLine = new Dictionary<int, List<(double X, string Text)>>();
+        var listener = new TextRenderListener(tri =>
+        {
+            var s = tri.GetText();
+            if (string.IsNullOrEmpty(s)) return;
+            var start = tri.GetBaseline().GetStartPoint();
+            int bucket = (int)Math.Round(start.Get(1));
+            if (!byLine.TryGetValue(bucket, out var list))
+            {
+                list = new();
+                byLine[bucket] = list;
+            }
+            list.Add((start.Get(0), s));
+        });
+        new PdfCanvasProcessor(listener).ProcessPageContent(pdf.GetPage(1));
+        foreach (var list in byLine.Values)
+        {
+            list.Sort((a, b) => a.X.CompareTo(b.X));
+            var joined = string.Concat(list.Select(t => t.Text));
+            if (!joined.Contains("lthough", StringComparison.Ordinal)) continue;
+            // Skip the leading `*` Lbl render (single-glyph run of just `*`) — the
+            // paragraph's own line starts at the FIRST render whose text is longer
+            // than one char or whose text isn't a marker glyph.
+            foreach (var (x, text) in list)
+            {
+                if (text.Length == 1 && (text[0] == '*' || text[0] == '\uf0d8' || text[0] == '\u2022'))
+                {
+                    continue;
+                }
+                return x;
+            }
+        }
+        throw new Xunit.Sdk.XunitException("Note paragraph *Although… not found on page 1");
+    }
+
+    /// <summary>
+    /// PostScript font name of the FIRST rendered glyph on the *Although… line — should
+    /// be Arial-Italic (subset-prefixed, e.g. <c>BJSQKL+Arial,Italic</c>). Ordering is
+    /// by content-stream event order so we catch the initial 'A' rather than any
+    /// downstream substring that may share the line.
+    /// </summary>
+    private static string NoteParagraphFirstGlyphFontName(PdfDocument pdf)
+    {
+        (int LineBucket, double X, string Text, string FontName)? firstOnLine = null;
+        int? targetBucket = null;
+        var listener = new TextRenderListener(tri =>
+        {
+            var s = tri.GetText();
+            if (string.IsNullOrEmpty(s)) return;
+            var start = tri.GetBaseline().GetStartPoint();
+            int bucket = (int)Math.Round(start.Get(1));
+            var fp = tri.GetFont()?.GetFontProgram()?.GetFontNames();
+            var name = fp?.GetFontName() ?? "";
+            // Latch onto the bucket that contains the "lthough" needle, then keep the
+            // leftmost render on that bucket.
+            if (targetBucket is null && s.Contains("lthough", StringComparison.Ordinal))
+            {
+                targetBucket = bucket;
+            }
+            if (targetBucket == bucket &&
+                (firstOnLine is null || start.Get(0) < firstOnLine.Value.X))
+            {
+                firstOnLine = (bucket, start.Get(0), s, name);
+            }
+        });
+        new PdfCanvasProcessor(listener).ProcessPageContent(pdf.GetPage(1));
+        if (firstOnLine is null)
+        {
+            throw new Xunit.Sdk.XunitException("Note paragraph *Although… not found on page 1");
+        }
+        return firstOnLine.Value.FontName;
+    }
+
     /// <summary>
     /// Return the baseline Y of the text chunk whose Y group's concatenated text starts
     /// with <paramref name="needle"/>. Some PDFs split a single visible line into many

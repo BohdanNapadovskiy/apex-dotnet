@@ -224,7 +224,27 @@ public sealed class EditEngine
             glyphBaselineY,
             nextSiblingTopY,
             sourceRuns,
-            SourceLineGap(geom, target.Page, target.Mcid)));
+            SourceLineGap(geom, target.Page, target.Mcid),
+            FirstLineIndentX(target)));
+    }
+
+    /// <summary>
+    /// Line 0 of a source paragraph can sit right of the paragraph margin — e.g. a Note
+    /// paragraph on Ram p1 whose <c>*</c> label is a sibling MCID at X=84.984 and whose
+    /// text starts at X=88.485. <see cref="TreeNode.X"/> is the union bbox left edge
+    /// (min across boxes), which loses that indent. Return line 0's own X so the writer
+    /// can position the first line of the replacement clear of the leading label.
+    /// NaN when there are no per-line boxes or line 0 sits at the union edge.
+    /// </summary>
+    private static double FirstLineIndentX(TreeNode target)
+    {
+        if (target.Boxes is not { Count: > 0 } boxes) return double.NaN;
+        var first = boxes[0];
+        if (first is null) return double.NaN;
+        // Ignore sub-point drift — box positions coming out of the extractor round to
+        // ~0.001pt but the writer emits at F2/F6, so anything < 0.5pt is noise.
+        if (Math.Abs(first.X - target.X) < 0.5) return double.NaN;
+        return first.X;
     }
 
     /// <summary>

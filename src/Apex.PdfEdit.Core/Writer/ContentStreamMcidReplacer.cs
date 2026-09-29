@@ -159,6 +159,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         if (originalBytes is null || originalBytes.Length == 0) return;
 
         var resources = page.GetResources();
+        // Rendered-chars scan MUST run before we swap in the empty content stream:
+        // PageFontInventory.Of walks every page of the doc via a content-stream scan
+        // to learn which unicode code points each embedded font actually rendered.
+        // Chars only used on the target page (italic 'A' on Ram p1 Note MCID 6) would
+        // vanish from the scan if we cleared the page first — CanRenderStrict would
+        // then falsely reject the italic subset and the multi-font emitter would
+        // downgrade the glyph to the roman twin, mid-word.
+        var inventory = PageFontInventory.Of(page);
         var freshContent = new PdfStream();
         page.GetPdfObject().Put(PdfName.Contents, freshContent);
         page.GetPdfObject().SetModified();
@@ -171,7 +179,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             _currentPage = page,
             _outCanvas = new PdfCanvas(freshContent, resources, page.GetDocument()),
             _outStream = freshContent.GetOutputStream(),
-            _pageFontInventory = PageFontInventory.Of(page),
+            _pageFontInventory = inventory,
             _currentPageNumber = page.GetDocument().GetPageNumber(page)
         };
         proc.ProcessContent(originalBytes, resources);
@@ -633,7 +641,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         else if (segments is not null && segments.Count > 1)
         {
             var line = lines[0];
-            float lineX = AlignedX(overlay, font, fontSize, line);
+            float lineX = AlignedX(overlay, font, fontSize, line, 0);
             _outCanvas.SetTextMatrix(lineX, baselineY);
             foreach (var seg in segments)
             {
@@ -660,21 +668,41 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 ? _fontCache.LoadUniversalFallback(style)
                 : SystemFontLocator.LoadUniversalFallback(style))
                 ?? font;
+            // Zero Tw once up front. We justify multi-line paragraphs via TJ per-space
+            // adjustments (which work for Type 0 composite fonts), so any inherited Tw
+            // would double-space simple-font lines. See MultiFontLineEmitter.EmitRun.
+            if (justifyLines && baseTw != 0.0)
+            {
+                _outStream.WriteString("0 Tw\n");
+                baseTw = 0.0;
+            }
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
-                if (justifyLines)
-                {
-                    double lineTw = JustifiedTw(line, font, fontSize, bboxWidth, baseTc, baseTw, i == lines.Count - 1);
-                    _outStream.WriteString(lineTw.ToString("F6", CultureInfo.InvariantCulture) + " Tw\n");
-                }
-                float lineX = AlignedX(overlay, font, fontSize, line);
+                // Per-line justification amount (points of extra advance per word gap).
+                // JustifiedTw already returns 0 on the last line and on lines that already
+                // fill the bbox; we invert its sign here so a POSITIVE extraPt becomes a
+                // NEGATIVE TJ number that ADDS forward advance.
+                float lineBboxWidth = LineBboxWidth(overlay, bboxWidth, i);
+                double extraSpacePt = justifyLines
+                    ? JustifiedTw(line, font, fontSize, lineBboxWidth, baseTc, 0.0, i == lines.Count - 1)
+                    : 0.0;
+                double tjAdj = extraSpacePt > 0 && fontSize > 0
+                    ? -(extraSpacePt * 1000.0 / fontSize)
+                    : 0.0;
+                float lineX = AlignedX(overlay, font, fontSize, line, i);
                 float lineY = baselineY - i * lineHeight;
                 _outCanvas.SetTextMatrix(lineX, lineY);
                 if (_pageFontInventory is not null)
                 {
                     MultiFontLineEmitter.EmitLine(_outCanvas, line, font, pool,
-                        universalFallback, fontSize, _pageFontInventory, _currentPage);
+                        universalFallback, fontSize, _pageFontInventory, _currentPage, tjAdj);
+                }
+                else if (tjAdj != 0.0)
+                {
+                    MultiFontLineEmitter.EmitLine(_outCanvas, line, font,
+                        Array.Empty<PdfFont>(), universalFallback, fontSize,
+                        PageFontInventory.Empty, _currentPage, tjAdj);
                 }
                 else
                 {
@@ -969,22 +997,54 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     /// Compute the text-matrix X so a single line of the new content sits inside the original
     /// bbox consistently with the node's classified alignment. JUSTIFIED and UNKNOWN fall
     /// through to LEFT for POC.
+    ///
+    /// <paramref name="lineIndex"/> lets the caller opt into a per-line X: when the source
+    /// paragraph's first line is indented past a leading label glyph
+    /// (<see cref="SetTextOverlay.FirstLineX"/>) — e.g. a Note paragraph whose <c>*</c> Lbl
+    /// sits 3.5pt left of the paragraph text — line 0 uses that indent instead of the union
+    /// bbox left edge. Lines 2+ fall back to the union edge.
     /// </summary>
-    private static float AlignedX(SetTextOverlay overlay, PdfFont font, float fontSize, string lineText)
+    private static float AlignedX(SetTextOverlay overlay, PdfFont font, float fontSize, string lineText, int lineIndex = 0)
     {
+        double baseX = overlay.X;
+        double baseWidth = overlay.Width;
+        if (lineIndex == 0 && !double.IsNaN(overlay.FirstLineX))
+        {
+            baseX = overlay.FirstLineX;
+            // Trim the bbox width by the indent so justification math (right anchor / center)
+            // still snaps to the union bbox's right edge, matching how the source paragraph
+            // ends its first line at the same column as subsequent lines.
+            double indent = overlay.FirstLineX - overlay.X;
+            if (indent > 0) baseWidth = Math.Max(0, overlay.Width - indent);
+        }
         var a = overlay.Alignment;
         if (a == Alignment.Left || a == Alignment.Justified || a == Alignment.Unknown)
         {
-            return (float)overlay.X;
+            return (float)baseX;
         }
         float textWidth = font.GetWidth(lineText, fontSize);
-        float bboxWidth = (float)overlay.Width;
+        float bboxWidth = (float)baseWidth;
         if (a == Alignment.Center)
         {
-            return (float)overlay.X + (bboxWidth - textWidth) / 2f;
+            return (float)baseX + (bboxWidth - textWidth) / 2f;
         }
         // Right
-        return (float)overlay.X + bboxWidth - textWidth;
+        return (float)baseX + bboxWidth - textWidth;
+    }
+
+    /// <summary>
+    /// Per-line usable bbox width: line 0 may be shortened by the source's
+    /// <see cref="SetTextOverlay.FirstLineX"/> indent (see <see cref="AlignedX"/>) so
+    /// justification math snaps to the same right edge as subsequent lines instead of
+    /// overshooting by the indent amount.
+    /// </summary>
+    private static float LineBboxWidth(SetTextOverlay overlay, float unionWidth, int lineIndex)
+    {
+        if (lineIndex != 0 || double.IsNaN(overlay.FirstLineX)) return unionWidth;
+        double indent = overlay.FirstLineX - overlay.X;
+        if (indent <= 0) return unionWidth;
+        double shortened = overlay.Width - indent;
+        return (float)Math.Max(0, shortened);
     }
 
     private static float ApproxFromHeight(double h)
