@@ -52,6 +52,15 @@ public sealed class PageFontInventory
     }
 
     /// <summary>
+    /// Empty inventory — no fonts, no rendered-chars data. Used by callers that need to
+    /// route through <see cref="MultiFontLineEmitter"/> for a side effect (e.g. TJ-based
+    /// justification) but don't have a real page inventory to hand.
+    /// </summary>
+    internal static readonly PageFontInventory Empty = new(
+        new Dictionary<PdfName, PdfFont>(),
+        new Dictionary<PdfIndirectReference, HashSet<int>>());
+
+    /// <summary>
     /// Build an inventory of every <see cref="PdfFont"/> referenced from <paramref name="page"/>'s
     /// resource dict, plus a per-font set of characters the document actually rendered
     /// (via a one-shot content-stream scan). Broken entries and scan failures are

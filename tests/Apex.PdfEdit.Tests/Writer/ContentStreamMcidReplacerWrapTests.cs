@@ -231,6 +231,89 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
         segs[1].Style.Size.Should().Be(12f);
     }
 
+    // justifiedTw
+
+    [Fact]
+    public void JustifiedTwLastLineReturnsBaseTw()
+    {
+        // Typographic convention: the paragraph's final line stays left-anchored, so no
+        // extra word spacing regardless of how short the line is.
+        ContentStreamMcidReplacer.JustifiedTw(
+            "trailing", _helvetica, 12f, 500f, baseTc: 0.0, baseTw: 0.5, isLastLine: true)
+            .Should().Be(0.5);
+    }
+
+    [Fact]
+    public void JustifiedTwLineWithoutSpacesReturnsBaseTw()
+    {
+        ContentStreamMcidReplacer.JustifiedTw(
+            "singleword", _helvetica, 12f, 500f, baseTc: 0.0, baseTw: 0.0, isLastLine: false)
+            .Should().Be(0.0);
+    }
+
+    [Fact]
+    public void JustifiedTwStretchesShortLineToBboxWidth()
+    {
+        // Slack per space stays inside the fontSize/2 sanity cap → helper divides it evenly.
+        var line = "aa bb cc";
+        float fontSize = 12f;
+        int spaces = line.Count(c => c == ' ');
+        double perSpace = 5.0;
+        double natural = _helvetica.GetWidth(line, fontSize);
+        float bboxWidth = (float)(natural + perSpace * spaces);
+        double tw = ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: false);
+        tw.Should().BeApproximately(perSpace, 0.001);
+    }
+
+    [Fact]
+    public void JustifiedTwCapsAtHalfFontSizePerSpace()
+    {
+        // Only one space to absorb ~200pt of slack → per-space gap would be 200pt, way over
+        // the fontSize/2 sanity cap → helper reverts to baseTw so we don't paint absurd gaps.
+        double tw = ContentStreamMcidReplacer.JustifiedTw(
+            "a b", _helvetica, fontSize: 12f, bboxWidth: 240f,
+            baseTc: 0.0, baseTw: 0.0, isLastLine: false);
+        tw.Should().Be(0.0);
+    }
+
+    [Fact]
+    public void JustifiedTwZeroExtraReturnsBaseTw()
+    {
+        // Line already fills the bbox → no inflation needed.
+        var line = "quick brown fox";
+        float fontSize = 12f;
+        float bboxWidth = (float)_helvetica.GetWidth(line, fontSize);
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.25, isLastLine: false)
+            .Should().Be(0.25);
+    }
+
+    // isHeadingOrHeaderTag
+
+    [Theory]
+    [InlineData("H1", true)]
+    [InlineData("H2", true)]
+    [InlineData("H3", true)]
+    [InlineData("H4", true)]
+    [InlineData("H5", true)]
+    [InlineData("H6", true)]
+    [InlineData("TH", true)]
+    [InlineData("P", false)]
+    [InlineData("Note", false)]
+    [InlineData("Link", false)]
+    [InlineData("LBody", false)]
+    [InlineData("TD", false)]          // table data cell — not TH
+    [InlineData("Hx", false)]          // invalid heading level
+    [InlineData("H", false)]           // just 'H'
+    [InlineData("H12", false)]         // > 6
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsHeadingOrHeaderTagRecognisesTheExpectedShapes(string? tag, bool expected)
+    {
+        ContentStreamMcidReplacer.IsHeadingOrHeaderTag(tag).Should().Be(expected);
+    }
+
     private static IList<PdfObject> TfOps(string fontName, double size)
         => new List<PdfObject> { new PdfName(fontName), new PdfNumber(size) };
 

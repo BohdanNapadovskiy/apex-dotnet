@@ -224,7 +224,27 @@ public sealed class EditEngine
             glyphBaselineY,
             nextSiblingTopY,
             sourceRuns,
-            SourceLineGap(geom, target.Page, target.Mcid)));
+            SourceLineGap(geom, target.Page, target.Mcid),
+            FirstLineIndentX(target)));
+    }
+
+    /// <summary>
+    /// Line 0 of a source paragraph can sit right of the paragraph margin — e.g. a Note
+    /// paragraph on Ram p1 whose <c>*</c> label is a sibling MCID at X=84.984 and whose
+    /// text starts at X=88.485. <see cref="TreeNode.X"/> is the union bbox left edge
+    /// (min across boxes), which loses that indent. Return line 0's own X so the writer
+    /// can position the first line of the replacement clear of the leading label.
+    /// NaN when there are no per-line boxes or line 0 sits at the union edge.
+    /// </summary>
+    private static double FirstLineIndentX(TreeNode target)
+    {
+        if (target.Boxes is not { Count: > 0 } boxes) return double.NaN;
+        var first = boxes[0];
+        if (first is null) return double.NaN;
+        // Ignore sub-point drift — box positions coming out of the extractor round to
+        // ~0.001pt but the writer emits at F2/F6, so anything < 0.5pt is noise.
+        if (Math.Abs(first.X - target.X) < 0.5) return double.NaN;
+        return first.X;
     }
 
     /// <summary>
@@ -232,19 +252,42 @@ public sealed class EditEngine
     /// block is single-line or the gaps are irregular. Lets the writer re-wrap multi-line
     /// replacements at the SOURCE spacing instead of the font's natural leading (PLATO p1:
     /// a double-spaced worksheet paragraph collapsed into tight lines).
+    ///
+    /// Row-clustering tolerance is derived from the SMALLEST glyph height on the block
+    /// rather than a fixed 1pt. Inline styling — bold-italic runs that grow the glyph bbox,
+    /// superscripts, mixed sizes — shifts the bbox-bottom (which is what geometry.json's
+    /// <c>Y</c> field reports) by several points WITHIN a single visual line; a 1pt cutoff
+    /// mistook that shift for a new line (Feedback 1.1 TCC page 4: bold-italic "illicit
+    /// discharge" at Y=517.29 vs surrounding regular text at Y=519.51 registered as 2.22pt
+    /// "leading", so the writer stacked wrapped lines 2.22pt apart and rendered them on
+    /// top of each other).
     /// </summary>
     private static double SourceLineGap(GeometryJson? geom, int page, int mcid)
     {
         if (geom is null) return 0;
-        var ys = new List<double>();
+        double minHeight = double.PositiveInfinity;
+        var raw = new List<double>();
         foreach (var g in geom.GlyphsFor(page, mcid))
         {
+            raw.Add(g.Y);
+            if (g.Height > 0 && g.Height < minHeight) minHeight = g.Height;
+        }
+        if (raw.Count == 0) return 0;
+        // Tolerance: half the smallest glyph height, floored at 1pt. A true new line
+        // sits at least a full glyph height below the previous one; anything closer is
+        // intra-line box-bottom drift from mixed fonts.
+        double tol = double.IsPositiveInfinity(minHeight)
+            ? 1.0
+            : Math.Max(1.0, minHeight * 0.5);
+        var ys = new List<double>();
+        foreach (var y in raw)
+        {
             bool seen = false;
-            foreach (var y in ys)
+            foreach (var existing in ys)
             {
-                if (Math.Abs(y - g.Y) < 1.0) { seen = true; break; }
+                if (Math.Abs(existing - y) < tol) { seen = true; break; }
             }
-            if (!seen) ys.Add(g.Y);
+            if (!seen) ys.Add(y);
         }
         if (ys.Count < 2) return 0;
         ys.Sort();

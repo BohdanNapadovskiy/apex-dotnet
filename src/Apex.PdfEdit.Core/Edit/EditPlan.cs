@@ -120,7 +120,8 @@ public sealed record SetTextOverlay(
     double GlyphBaselineY,
     double NextSiblingTopY,
     IReadOnlyList<TextRun> SourceRuns,
-    double SourceLeading = 0)
+    double SourceLeading = 0,
+    double FirstLineX = double.NaN)
 {
     /// <summary>Back-compat: no NextSiblingTopY, no source runs.</summary>
     public SetTextOverlay(int page, double x, double y, double width, double height,
