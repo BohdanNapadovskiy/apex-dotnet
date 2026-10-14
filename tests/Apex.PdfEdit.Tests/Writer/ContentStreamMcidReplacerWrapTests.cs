@@ -1,3 +1,5 @@
+using Apex.PdfEdit.Core.Edit;
+using Apex.PdfEdit.Core.Layout;
 using Apex.PdfEdit.Core.Writer;
 using FluentAssertions;
 using iText.IO.Font.Constants;
@@ -287,6 +289,75 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
         ContentStreamMcidReplacer.JustifiedTw(
             line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.25, isLastLine: false)
             .Should().Be(0.25);
+    }
+
+    // space compression (Feedback 1.3)
+
+    [Fact]
+    public void WrapTextPacksOneMoreWordWhenSpacesMayShrink()
+    {
+        // "aa bb cc" misses the bbox by 1pt at natural spacing; 0.6pt off each of its two
+        // spaces makes it fit.
+        float fontSize = 12f;
+        float maxWidth = _helvetica.GetWidth("aa bb cc", fontSize) - 1f;
+        ContentStreamMcidReplacer.WrapText("aa bb cc", _helvetica, fontSize, maxWidth)
+            .Should().Equal("aa bb", "cc");
+        ContentStreamMcidReplacer.WrapText("aa bb cc", _helvetica, fontSize, maxWidth, shrinkPerSpace: 0.6)
+            .Should().Equal("aa bb cc");
+        ContentStreamMcidReplacer.WrapText("aa bb cc", _helvetica, fontSize, maxWidth, shrinkPerSpace: 0.4)
+            .Should().Equal("aa bb", "cc");
+    }
+
+    [Fact]
+    public void JustifiedTwCompressesOverfullLineWithinAllowance()
+    {
+        var line = "aa bb cc";
+        float fontSize = 12f;
+        float bboxWidth = _helvetica.GetWidth(line, fontSize) - 1f;
+        // Needs -0.5pt per space; allowed.
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: false, maxShrinkPerSpace: 0.6)
+            .Should().BeApproximately(-0.5, 0.001);
+        // The last line is compressed too — the wrap may have packed it the same way.
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: true, maxShrinkPerSpace: 0.6)
+            .Should().BeApproximately(-0.5, 0.001);
+        // Never beyond the allowance.
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: false, maxShrinkPerSpace: 0.2)
+            .Should().BeApproximately(-0.2, 0.001);
+    }
+
+    [Fact]
+    public void JustifiedTwLastLineStaysUnstretchedWhenShrinkAllowed()
+    {
+        ContentStreamMcidReplacer.JustifiedTw(
+            "aa bb cc", _helvetica, 12f, 500f, baseTc: 0.0, baseTw: 0.0, isLastLine: true, maxShrinkPerSpace: 0.6)
+            .Should().Be(0.0);
+    }
+
+    [Fact]
+    public void SpaceShrinkOnlyWhenJustifiedSourceCompressedItsSpaces()
+    {
+        float fontSize = 9f;
+        double natural = _helvetica.GetWidth(" ", fontSize);
+        SetTextOverlay Overlay(Alignment alignment, double minGap) => new(
+            1, 0, 0, 400, 30, "text", new FontStyle("Helvetica", 9f, "normal", "#000000"), alignment, "n", 0,
+            double.NaN, double.NaN, Array.Empty<TextRun>(), SourceMinWordGap: minGap);
+
+        // Source tightest line 0.3pt under natural → that much plus headroom.
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, natural - 0.3), _helvetica, fontSize)
+            .Should().BeApproximately(0.345, 0.001);
+        // Source at or above natural spacing, unknown, or not justified → never compress.
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, natural + 1.0), _helvetica, fontSize)
+            .Should().Be(0.0);
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, double.NaN), _helvetica, fontSize)
+            .Should().Be(0.0);
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Left, natural - 0.3), _helvetica, fontSize)
+            .Should().Be(0.0);
+        // Capped at a quarter of the space however tight the source looks.
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, natural * 0.2), _helvetica, fontSize)
+            .Should().BeApproximately(natural * 0.25, 0.001);
     }
 
     // isHeadingOrHeaderTag

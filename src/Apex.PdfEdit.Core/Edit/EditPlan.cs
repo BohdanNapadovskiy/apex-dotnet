@@ -105,6 +105,11 @@ public sealed class EditPlan
 /// <see cref="SourceRuns"/>: source's inline text runs (font/size/weight/colour) captured
 /// by the resolver, in source order. When any run's exact text substring survives verbatim
 /// in <see cref="NewContent"/>, the writer re-emits that substring with the run's original style.
+///
+/// <see cref="SourceMinWordGap"/>: mean word gap (pt) on the source paragraph's TIGHTEST
+/// line. When it is below the font's natural space width the source justifier compressed
+/// spaces to fit one more word; the writer then allows the same compression when it
+/// re-wraps. NaN means "unknown — never compress".
 /// </summary>
 public sealed record SetTextOverlay(
     int Page,
@@ -121,7 +126,8 @@ public sealed record SetTextOverlay(
     double NextSiblingTopY,
     IReadOnlyList<TextRun> SourceRuns,
     double SourceLeading = 0,
-    double FirstLineX = double.NaN)
+    double FirstLineX = double.NaN,
+    double SourceMinWordGap = double.NaN)
 {
     /// <summary>Back-compat: no NextSiblingTopY, no source runs.</summary>
     public SetTextOverlay(int page, double x, double y, double width, double height,

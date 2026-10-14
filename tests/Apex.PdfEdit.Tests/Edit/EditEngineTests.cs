@@ -472,6 +472,40 @@ public sealed class EditEngineTests
     }
 
     [Fact]
+    public void SourceMinWordGapReportsTightestLine()
+    {
+        // Feedback 1.3: two full lines, 10pt glyphs. Line 1 words sit 3pt apart, line 2
+        // 2pt apart (compressed); letter gaps (0.05pt) are not word gaps. The one-word
+        // last line contributes nothing.
+        List<Glyph> Line(double y, double wordGap)
+        {
+            var glyphs = new List<Glyph>();
+            double x = 100;
+            for (int w = 0; w < 4; w++)
+            {
+                glyphs.Add(GlyphAt(x, y, 20, 10));
+                glyphs.Add(GlyphAt(x + 20.05, y, 20, 10));
+                x += 40.05 + wordGap;
+            }
+            return glyphs;
+        }
+        var glyphs = Line(700, 3.0);
+        glyphs.AddRange(Line(688, 2.0));
+        glyphs.Add(GlyphAt(100, 676, 20, 10));
+        var geom = new GeometryJson
+        {
+            PageMcidWords = new Dictionary<string, Dictionary<string, List<Glyph>>>
+            {
+                ["1"] = new() { ["6"] = glyphs, ["7"] = new() { GlyphAt(100, 600, 300, 10) } }
+            }
+        };
+
+        EditEngine.SourceMinWordGap(geom, 1, 6).Should().BeApproximately(2.0, 1e-6);
+        double.IsNaN(EditEngine.SourceMinWordGap(geom, 1, 7)).Should().BeTrue();
+        double.IsNaN(EditEngine.SourceMinWordGap(null, 1, 6)).Should().BeTrue();
+    }
+
+    [Fact]
     public void AddParagraphPushDownShiftsOrphanGeometryMcids()
     {
         var doc = ThreeParagraphSect();

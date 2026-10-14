@@ -49,6 +49,13 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     private const float DescenderAdjustRatio = 0.3f;
 
     /// <summary>
+    /// Upper bound on how much of the natural space width a justified line may give up
+    /// when the source paragraph shows compressed spaces (see <see cref="SpaceShrinkPt"/>).
+    /// Beyond a quarter of the space, words visibly run together.
+    /// </summary>
+    private const double MaxSpaceShrinkRatio = 0.25;
+
+    /// <summary>
     /// Recognises a Table-of-Contents row: any content that ends with whitespace + one
     /// or more digits (the page number). Group 1 is the title, group 2 is the pagenum.
     /// Used by the TOC-shape re-emit path in <see cref="EmitReplacement"/>.
@@ -506,7 +513,8 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         float bboxWidth = (float)overlay.Width;
         float bboxHeight = (float)overlay.Height;
-        var lines = WrapText(overlay.NewContent, font, fontSize, bboxWidth);
+        double spaceShrink = SpaceShrinkPt(overlay, font, fontSize);
+        var lines = WrapText(overlay.NewContent, font, fontSize, bboxWidth, spaceShrink);
         float lineHeight = fontSize * EffectiveLeadingMultiplier(style);
         // Prefer the SOURCE block's observed baseline gap over natural leading: a
         // double-spaced worksheet paragraph re-wrapped at natural leading collapses into
@@ -682,12 +690,13 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 // Per-line justification amount (points of extra advance per word gap).
                 // JustifiedTw already returns 0 on the last line and on lines that already
                 // fill the bbox; we invert its sign here so a POSITIVE extraPt becomes a
-                // NEGATIVE TJ number that ADDS forward advance.
+                // NEGATIVE TJ number that ADDS forward advance. A negative extraPt (line
+                // packed with compressed spaces, see SpaceShrinkPt) tightens the gaps.
                 float lineBboxWidth = LineBboxWidth(overlay, bboxWidth, i);
                 double extraSpacePt = justifyLines
-                    ? JustifiedTw(line, font, fontSize, lineBboxWidth, baseTc, 0.0, i == lines.Count - 1)
+                    ? JustifiedTw(line, font, fontSize, lineBboxWidth, baseTc, 0.0, i == lines.Count - 1, spaceShrink)
                     : 0.0;
-                double tjAdj = extraSpacePt > 0 && fontSize > 0
+                double tjAdj = extraSpacePt != 0 && fontSize > 0
                     ? -(extraSpacePt * 1000.0 / fontSize)
                     : 0.0;
                 float lineX = AlignedX(overlay, font, fontSize, line, i);
@@ -803,8 +812,12 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     /// Greedy word-wrap: pack words into a line while the running measured width fits within
     /// <paramref name="maxWidth"/>. Words wider than the bbox go on their own line (overflow
     /// to the right rather than break mid-word). Empty input yields <c>[""]</c>.
+    /// <paramref name="shrinkPerSpace"/> (pt) lets each space on a line give up that much
+    /// width before the line counts as full — the caller must then emit the line with the
+    /// matching compression (<see cref="JustifiedTw"/>).
     /// </summary>
-    internal static List<string> WrapText(string? text, PdfFont font, float fontSize, float maxWidth)
+    internal static List<string> WrapText(string? text, PdfFont font, float fontSize, float maxWidth,
+        double shrinkPerSpace = 0.0)
     {
         var lines = new List<string>();
         if (string.IsNullOrEmpty(text))
@@ -820,13 +833,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         // Split on embedded newlines first so \n becomes an explicit hard break.
         foreach (var segment in text.Split('\n'))
         {
-            WrapSegment(segment, font, fontSize, maxWidth, lines);
+            WrapSegment(segment, font, fontSize, maxWidth, shrinkPerSpace, lines);
         }
         if (lines.Count == 0) lines.Add(string.Empty);
         return lines;
     }
 
-    private static void WrapSegment(string segment, PdfFont font, float fontSize, float maxWidth, List<string> output)
+    private static void WrapSegment(string segment, PdfFont font, float fontSize, float maxWidth,
+        double shrinkPerSpace, List<string> output)
     {
         if (segment.Length == 0)
         {
@@ -835,6 +849,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         }
         var words = segment.Split(' ');
         var current = new StringBuilder();
+        int spaces = 0;
         foreach (var word in words)
         {
             if (current.Length == 0)
@@ -843,16 +858,18 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 continue;
             }
             var candidate = current.ToString() + " " + word;
-            if (font.GetWidth(candidate, fontSize) <= maxWidth)
+            if (font.GetWidth(candidate, fontSize) - shrinkPerSpace * (spaces + 1) <= maxWidth)
             {
                 current.Clear();
                 current.Append(candidate);
+                spaces++;
             }
             else
             {
                 output.Add(current.ToString());
                 current.Clear();
                 current.Append(word);
+                spaces = 0;
             }
         }
         if (current.Length > 0) output.Add(current.ToString());
@@ -970,12 +987,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     /// exactly fill <paramref name="bboxWidth"/>. Last line of a paragraph and lines with
     /// no spaces or with tolerable natural width fall back to <paramref name="baseTw"/>.
     /// A per-space cap of <c>fontSize/2</c> prevents an under-full trailing line from
-    /// blowing up into visible gaps.
+    /// blowing up into visible gaps. A line WIDER than the bbox — only possible when the
+    /// wrap packed it with <paramref name="maxShrinkPerSpace"/> — gets a negative
+    /// adjustment, bounded by that same allowance, on every line including the last.
     /// </summary>
     internal static double JustifiedTw(string lineText, PdfFont font, float fontSize,
-        float bboxWidth, double baseTc, double baseTw, bool isLastLine)
+        float bboxWidth, double baseTc, double baseTw, bool isLastLine, double maxShrinkPerSpace = 0.0)
     {
-        if (isLastLine) return baseTw;
+        if (isLastLine && maxShrinkPerSpace <= 0) return baseTw;
         int spaces = 0;
         for (int i = 0; i < lineText.Length; i++)
         {
@@ -987,7 +1006,11 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             + baseTc * Math.Max(0, lineText.Length - 1)
             + baseTw * spaces;
         double extra = bboxWidth - naturalWidth;
-        if (extra <= 0) return baseTw;
+        if (extra < 0 && maxShrinkPerSpace > 0)
+        {
+            return baseTw + Math.Max(extra / spaces, -maxShrinkPerSpace);
+        }
+        if (extra <= 0 || isLastLine) return baseTw;
         double perSpace = extra / spaces;
         if (perSpace > fontSize * 0.5) return baseTw;
         return baseTw + perSpace;
@@ -1038,6 +1061,29 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     /// justification math snaps to the same right edge as subsequent lines instead of
     /// overshooting by the indent amount.
     /// </summary>
+    /// <summary>
+    /// Points each space may be compressed when re-wrapping a justified paragraph: the
+    /// amount the source's own tightest line sits below the font's natural space width
+    /// (<see cref="SetTextOverlay.SourceMinWordGap"/>), capped at
+    /// <see cref="MaxSpaceShrinkRatio"/>. Zero when the source never compressed, so
+    /// paragraphs laid out at natural-or-wider spacing wrap exactly as before. Without
+    /// this a word the source squeezed onto a line drops to the next one and the line it
+    /// left is stretched to roughly double its gaps (Feedback 1.3). Diverges from Java,
+    /// which always wraps at natural spacing — PORTING_PLAN §9.
+    /// </summary>
+    internal static double SpaceShrinkPt(SetTextOverlay overlay, PdfFont font, float fontSize)
+    {
+        if (overlay.Alignment != Alignment.Justified || !double.IsFinite(overlay.SourceMinWordGap)) return 0.0;
+        double naturalSpace = font.GetWidth(" ", fontSize);
+        double observed = naturalSpace - overlay.SourceMinWordGap;
+        // Sub-0.1pt differences are measurement noise in the extractor's glyph boxes.
+        if (naturalSpace <= 0 || observed < 0.1) return 0.0;
+        // 15% headroom: the source line also carries inter-letter TJ kerning the word-gap
+        // measure cannot see (Sample2 Note line 2: 0.56pt), so the bare observed amount
+        // leaves the source's own tightest line a fraction of a point too wide to re-fit.
+        return Math.Min(observed * 1.15, naturalSpace * MaxSpaceShrinkRatio);
+    }
+
     private static float LineBboxWidth(SetTextOverlay overlay, float unionWidth, int lineIndex)
     {
         if (lineIndex != 0 || double.IsNaN(overlay.FirstLineX)) return unionWidth;

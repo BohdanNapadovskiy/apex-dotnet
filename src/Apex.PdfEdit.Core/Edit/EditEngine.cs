@@ -225,7 +225,60 @@ public sealed class EditEngine
             nextSiblingTopY,
             sourceRuns,
             SourceLineGap(geom, target.Page, target.Mcid),
-            FirstLineIndentX(target)));
+            FirstLineIndentX(target),
+            SourceMinWordGap(geom, target.Page, target.Mcid)));
+    }
+
+    /// <summary>
+    /// Mean word gap (pt) on the tightest line of the source block, measured from
+    /// geometry.json glyph boxes; NaN when no line has at least two word gaps. A justified
+    /// source paragraph whose tightest line sits BELOW the font's natural space width was
+    /// laid out by a justifier that compresses spaces to fit one more word (Word does);
+    /// re-wrapping at natural spacing then pushes that word down and stretches the line
+    /// it left (Feedback 1.3 Sample2 Note: 2.13pt gaps became 4.87pt). The writer uses
+    /// this to allow the same compression. Not in the Java reference — PORTING_PLAN §9.
+    /// </summary>
+    internal static double SourceMinWordGap(GeometryJson? geom, int page, int mcid)
+    {
+        if (geom is null) return double.NaN;
+        var glyphs = geom.GlyphsFor(page, mcid);
+        double minHeight = double.PositiveInfinity;
+        foreach (var g in glyphs)
+        {
+            if (g.Height > 0 && g.Height < minHeight) minHeight = g.Height;
+        }
+        if (double.IsPositiveInfinity(minHeight)) return double.NaN;
+        // Same row tolerance as SourceLineGap; a word gap is any horizontal gap wider
+        // than a tenth of the glyph height (letter gaps are kerning-sized, ~0).
+        double rowTol = Math.Max(1.0, minHeight * 0.5);
+        double wordGapMin = minHeight * 0.1;
+        var rows = new List<List<Glyph>>();
+        foreach (var g in glyphs)
+        {
+            List<Glyph>? row = null;
+            foreach (var r in rows)
+            {
+                if (Math.Abs(r[0].Y - g.Y) < rowTol) { row = r; break; }
+            }
+            if (row is null) rows.Add(row = new List<Glyph>());
+            row.Add(g);
+        }
+        double tightest = double.NaN;
+        foreach (var row in rows)
+        {
+            row.Sort((l, r) => l.X.CompareTo(r.X));
+            double sum = 0;
+            int count = 0;
+            for (int i = 1; i < row.Count; i++)
+            {
+                double gap = row[i].X - (row[i - 1].X + row[i - 1].Width);
+                if (gap > wordGapMin) { sum += gap; count++; }
+            }
+            if (count < 2) continue;
+            double mean = sum / count;
+            if (double.IsNaN(tightest) || mean < tightest) tightest = mean;
+        }
+        return tightest;
     }
 
     /// <summary>
