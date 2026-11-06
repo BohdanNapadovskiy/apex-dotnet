@@ -684,6 +684,11 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 _outStream.WriteString("0 Tw\n");
                 baseTw = 0.0;
             }
+            // Lines that close a hard-break ('\n') segment end a paragraph of their own and,
+            // like the final line, are left unstretched.
+            var segmentEnds = justifyLines
+                ? SegmentEndLineIndices(overlay.NewContent, font, fontSize, bboxWidth, spaceShrink, lines.Count)
+                : null;
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
@@ -693,8 +698,15 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 // NEGATIVE TJ number that ADDS forward advance. A negative extraPt (line
                 // packed with compressed spaces, see SpaceShrinkPt) tightens the gaps.
                 float lineBboxWidth = LineBboxWidth(overlay, bboxWidth, i);
+                // Measure with the fonts the emitter will really use per char, so fallback
+                // glyphs don't skew the slack.
+                double? glyphWidth = justifyLines && _pageFontInventory is not null
+                    ? MultiFontLineEmitter.MeasureLine(line, font, pool, universalFallback,
+                        fontSize, _pageFontInventory, _currentPage)
+                    : null;
                 double extraSpacePt = justifyLines
-                    ? JustifiedTw(line, font, fontSize, lineBboxWidth, baseTc, 0.0, i == lines.Count - 1, spaceShrink)
+                    ? JustifiedTw(line, font, fontSize, lineBboxWidth, baseTc, 0.0,
+                        i == lines.Count - 1 || segmentEnds!.Contains(i), spaceShrink, glyphWidth)
                     : 0.0;
                 double tjAdj = extraSpacePt != 0 && fontSize > 0
                     ? -(extraSpacePt * 1000.0 / fontSize)
@@ -986,13 +998,18 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     /// Compute the word-spacing (<c>Tw</c>) that stretches <paramref name="lineText"/> to
     /// exactly fill <paramref name="bboxWidth"/>. Last line of a paragraph and lines with
     /// no spaces or with tolerable natural width fall back to <paramref name="baseTw"/>.
-    /// A per-space cap of <c>fontSize/2</c> prevents an under-full trailing line from
-    /// blowing up into visible gaps. A line WIDER than the bbox — only possible when the
+    /// Every other line is stretched however wide the gaps get — a line that broke early
+    /// before a long word still ends on the right edge, as in Word / Acrobat (Feedback 1.4
+    /// Sample2 Note: line 1 needs ~18pt gaps; the old fontSize/2 cap left it ragged and the
+    /// paragraph read as left-aligned). A line WIDER than the bbox — only possible when the
     /// wrap packed it with <paramref name="maxShrinkPerSpace"/> — gets a negative
     /// adjustment, bounded by that same allowance, on every line including the last.
+    /// <paramref name="glyphWidth"/> overrides <paramref name="font"/>'s measurement when the
+    /// line is drawn across several fonts (see <see cref="MultiFontLineEmitter.MeasureLine"/>).
     /// </summary>
     internal static double JustifiedTw(string lineText, PdfFont font, float fontSize,
-        float bboxWidth, double baseTc, double baseTw, bool isLastLine, double maxShrinkPerSpace = 0.0)
+        float bboxWidth, double baseTc, double baseTw, bool isLastLine, double maxShrinkPerSpace = 0.0,
+        double? glyphWidth = null)
     {
         if (isLastLine && maxShrinkPerSpace <= 0) return baseTw;
         int spaces = 0;
@@ -1001,8 +1018,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             if (lineText[i] == ' ') spaces++;
         }
         if (spaces == 0) return baseTw;
-        double glyphWidth = font.GetWidth(lineText, fontSize);
-        double naturalWidth = glyphWidth
+        double naturalWidth = (glyphWidth ?? font.GetWidth(lineText, fontSize))
             + baseTc * Math.Max(0, lineText.Length - 1)
             + baseTw * spaces;
         double extra = bboxWidth - naturalWidth;
@@ -1011,9 +1027,28 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             return baseTw + Math.Max(extra / spaces, -maxShrinkPerSpace);
         }
         if (extra <= 0 || isLastLine) return baseTw;
-        double perSpace = extra / spaces;
-        if (perSpace > fontSize * 0.5) return baseTw;
-        return baseTw + perSpace;
+        return baseTw + extra / spaces;
+    }
+
+    /// <summary>
+    /// Indices into <see cref="WrapText"/>'s output of the lines that close a hard-break
+    /// (<c>'\n'</c>) segment, excluding the final line. Empty when the wrap was collapsed
+    /// (line count no longer matches the per-segment wrap).
+    /// </summary>
+    internal static HashSet<int> SegmentEndLineIndices(string? text, PdfFont font, float fontSize,
+        float maxWidth, double shrinkPerSpace, int lineCount)
+    {
+        var ends = new HashSet<int>();
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0.0f || !text.Contains('\n')) return ends;
+        var scratch = new List<string>();
+        foreach (var segment in text.Split('\n'))
+        {
+            WrapSegment(segment, font, fontSize, maxWidth, shrinkPerSpace, scratch);
+            ends.Add(scratch.Count - 1);
+        }
+        if (scratch.Count != lineCount) return new HashSet<int>();
+        ends.Remove(lineCount - 1);
+        return ends;
     }
 
     /// <summary>

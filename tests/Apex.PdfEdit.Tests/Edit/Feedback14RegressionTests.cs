@@ -106,6 +106,41 @@ public sealed class Feedback14RegressionTests
             string.Join(" ", bold.Select(g => $"'{g.Text}'={g.Font}")));
     }
 
+    [FactIfSample(Pdf)]
+    public void EditedNoteParagraphStaysJustified()
+    {
+        // Source Note lines 1-2 end on the bbox right edge (x≈526.6). The edit breaks line 1
+        // early before the ~190pt "information.QWERTY…BNM." token, so filling it needs ~18pt
+        // gaps: the old fontSize/2 cap left it ragged (x=339.6), and line 2 — which mixes
+        // in fallback glyphs — was measured in the primary subset and stopped 22pt short.
+        using var reader = new PdfReader(new MemoryStream(RunPipeline()));
+        using var pdf = new PdfDocument(reader);
+        var byY = new SortedDictionary<double, (double X0, double X1, string Text)>();
+        var listener = new TextRenderListener(tri =>
+        {
+            var s = tri.GetText();
+            if (string.IsNullOrWhiteSpace(s)) return;
+            var b = tri.GetBaseline();
+            double y = -Math.Round(b.GetStartPoint().Get(1), 1);
+            double x0 = b.GetStartPoint().Get(0), x1 = b.GetEndPoint().Get(0);
+            byY[y] = byY.TryGetValue(y, out var cur)
+                ? (Math.Min(cur.X0, x0), Math.Max(cur.X1, x1), cur.Text + s)
+                : (x0, x1, s);
+        });
+        new PdfCanvasProcessor(listener).ProcessPageContent(pdf.GetPage(1));
+        var lines = byY.Values.ToList();
+
+        int first = lines.FindIndex(l => l.Text.Contains("*Although"));
+        first.Should().BeGreaterThanOrEqualTo(0);
+        lines[first + 1].Text.Should().Contain("QWERTY");
+        lines[first + 2].Text.Should().Contain("!@#");
+
+        // Node 8 bbox right edge: 84.98 + 441.67.
+        lines[first].X1.Should().BeApproximately(526.65, 1.0, "line 1 is justified to the right edge");
+        lines[first + 1].X1.Should().BeApproximately(526.65, 1.0, "line 2 is justified to the right edge");
+        lines[first + 2].X1.Should().BeLessThan(300, "the paragraph's last line stays ragged");
+    }
+
     /// <summary>
     /// Callback-based text-render listener (private copy — the sibling ones are nested
     /// in other test classes and not visible here).

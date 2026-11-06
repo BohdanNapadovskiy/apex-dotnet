@@ -269,14 +269,27 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
     }
 
     [Fact]
-    public void JustifiedTwCapsAtHalfFontSizePerSpace()
+    public void JustifiedTwStretchesNonFinalLineEvenWithWideGaps()
     {
-        // Only one space to absorb ~200pt of slack → per-space gap would be 200pt, way over
-        // the fontSize/2 sanity cap → helper reverts to baseTw so we don't paint absurd gaps.
+        // A mid-paragraph line that broke early before a long word must still reach the
+        // right edge (Feedback 1.4: the old fontSize/2 cap left it ragged, reading as LEFT).
+        const string line = "a b";
+        double natural = _helvetica.GetWidth(line, 12f);
         double tw = ContentStreamMcidReplacer.JustifiedTw(
-            "a b", _helvetica, fontSize: 12f, bboxWidth: 240f,
+            line, _helvetica, fontSize: 12f, bboxWidth: 240f,
             baseTc: 0.0, baseTw: 0.0, isLastLine: false);
-        tw.Should().Be(0.0);
+        tw.Should().BeApproximately(240.0 - natural, 0.001);
+    }
+
+    [Fact]
+    public void SegmentEndLineIndicesMarksLinesBeforeHardBreaks()
+    {
+        const string text = "one two three four five six\nseven eight\nnine";
+        float width = _helvetica.GetWidth("one two three", 12f) + 1f;
+        var lines = ContentStreamMcidReplacer.WrapText(text, _helvetica, 12f, width);
+        lines.Should().Equal("one two three", "four five six", "seven eight", "nine");
+        ContentStreamMcidReplacer.SegmentEndLineIndices(text, _helvetica, 12f, width, 0.0, lines.Count)
+            .Should().BeEquivalentTo(new[] { 1, 2 }, "the final line is handled by isLastLine");
     }
 
     [Fact]

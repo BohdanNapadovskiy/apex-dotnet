@@ -93,6 +93,29 @@ internal static class MultiFontLineEmitter
     }
 
     /// <summary>
+    /// Advance width (pt, no Tc/Tw) of <paramref name="line"/> as <see cref="EmitLine(PdfCanvas, string, PdfFont?, IReadOnlyList{PdfFont}, PdfFont, float, PageFontInventory, PdfPage, double)"/>
+    /// will draw it — each char measured in the font <see cref="PickFontForChar"/> picks.
+    /// Measuring with the primary alone misjudges chars its subset lacks, so a justified
+    /// line holding fallback glyphs stopped short of the right edge (Feedback 1.4 Sample2
+    /// Note line 2: 22pt short).
+    /// </summary>
+    internal static double MeasureLine(string line, PdfFont? primary, IReadOnlyList<PdfFont> pool,
+        PdfFont fallback, float fontSize, PageFontInventory inv, PdfPage page)
+    {
+        if (string.IsNullOrEmpty(line)) return 0.0;
+        if (primary is null) return fallback.GetWidth(line, fontSize);
+        double width = 0.0;
+        for (int i = 0; i < line.Length;)
+        {
+            int cp = char.ConvertToUtf32(line, i);
+            var ch = char.ConvertFromUtf32(cp);
+            width += PickFontForChar(ch, primary, pool, fallback, inv, page).GetWidth(ch, fontSize);
+            i += char.IsHighSurrogate(line[i]) ? 2 : 1;
+        }
+        return width;
+    }
+
+    /// <summary>
     /// Emit a single-font run. Uses plain <c>Tj</c> when there is no per-space
     /// adjustment; otherwise builds a TJ array that splits the run at each space
     /// glyph and injects <paramref name="tjAdjustmentPer1000"/> between the halves.
