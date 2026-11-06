@@ -515,6 +515,12 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         float bboxHeight = (float)overlay.Height;
         double spaceShrink = SpaceShrinkPt(overlay, font, fontSize);
         var lines = WrapText(overlay.NewContent, font, fontSize, bboxWidth, spaceShrink);
+        if (overlay.Alignment == Alignment.Center && overlay.SourceLineWidths is { Count: >= 2 } sourceWidths)
+        {
+            lines = WrapToSourceLineWidths(overlay.NewContent, font, fontSize, sourceWidths)
+                ?? WrapToSourceLineCount(overlay.NewContent, font, fontSize, sourceWidths, bboxWidth)
+                ?? lines;
+        }
         float lineHeight = fontSize * EffectiveLeadingMultiplier(style);
         // Prefer the SOURCE block's observed baseline gap over natural leading: a
         // double-spaced worksheet paragraph re-wrapped at natural leading collapses into
@@ -850,6 +856,77 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         if (lines.Count == 0) lines.Add(string.Empty);
         return lines;
     }
+
+    /// <summary>
+    /// Re-wrap a CENTER block line by line to the source's own line widths, so a stacked
+    /// title keeps its breaks: the Board Packet p3 H2 is five centered lines inside a 362pt
+    /// bbox, and a greedy wrap to the bbox width collapsed it to three even when the edit
+    /// only changed the date. Line <c>i</c> may hold what source line <c>i</c> held plus a
+    /// small slack for measurement noise (extractor boxes vs <see cref="PdfFont.GetWidth(string, float)"/>).
+    /// Returns null — caller keeps the plain wrap — when the text needs more lines than the
+    /// source had, contains hard breaks, or there are fewer than two source lines.
+    /// </summary>
+    internal static List<string>? WrapToSourceLineWidths(string? text, PdfFont font, float fontSize,
+        IReadOnlyList<double>? lineWidths)
+    {
+        if (lineWidths is not { Count: >= 2 } || string.IsNullOrEmpty(text) || text.Contains('\n')) return null;
+        var lines = new List<string>();
+        var current = new StringBuilder();
+        foreach (var word in text.Split(' '))
+        {
+            if (current.Length == 0)
+            {
+                current.Append(word);
+                continue;
+            }
+            if (lines.Count >= lineWidths.Count) return null;
+            double max = lineWidths[lines.Count] * (1 + SourceLineWidthSlack) + 0.5;
+            var candidate = current + " " + word;
+            if (font.GetWidth(candidate, fontSize) <= max)
+            {
+                current.Append(' ').Append(word);
+            }
+            else
+            {
+                lines.Add(current.ToString());
+                current.Clear().Append(word);
+            }
+        }
+        if (current.Length > 0) lines.Add(current.ToString());
+        return lines.Count <= lineWidths.Count ? lines : null;
+    }
+
+    /// <summary>
+    /// Fallback for <see cref="WrapToSourceLineWidths"/> when the new words no longer fit the
+    /// source's line shapes (Board Packet p3 corpus edit moves "MINUTES" to the end — the
+    /// shaped wrap needs 6 lines): wrap at the narrowest width that still fits the text in
+    /// the source's line count, so a 5-line stacked title stays 5 centered lines instead of
+    /// collapsing to 3 bbox-wide ones. The width never drops below the source's mean line
+    /// width, so a shorter replacement keeps its natural, fewer lines. Null when the plain
+    /// wrap at <paramref name="maxWidth"/> already needs at least the source's line count.
+    /// </summary>
+    internal static List<string>? WrapToSourceLineCount(string? text, PdfFont font, float fontSize,
+        IReadOnlyList<double> lineWidths, float maxWidth)
+    {
+        if (lineWidths.Count < 2 || string.IsNullOrEmpty(text) || text.Contains('\n') || maxWidth <= 0) return null;
+        int target = lineWidths.Count;
+        if (WrapText(text, font, fontSize, maxWidth).Count >= target) return null;
+        double lo = Math.Min(lineWidths.Average(), maxWidth);
+        foreach (var word in text.Split(' ')) lo = Math.Max(lo, font.GetWidth(word, fontSize));
+        double hi = maxWidth;
+        if (WrapText(text, font, fontSize, (float)lo).Count <= target) return WrapText(text, font, fontSize, (float)lo);
+        // Line count is monotone non-increasing in width: bisect to ~0.5pt.
+        while (hi - lo > 0.5)
+        {
+            double mid = (lo + hi) / 2;
+            if (WrapText(text, font, fontSize, (float)mid).Count <= target) hi = mid;
+            else lo = mid;
+        }
+        return WrapText(text, font, fontSize, (float)hi);
+    }
+
+    /// <summary>Relative slack on a source line width in <see cref="WrapToSourceLineWidths"/>.</summary>
+    private const double SourceLineWidthSlack = 0.02;
 
     private static void WrapSegment(string segment, PdfFont font, float fontSize, float maxWidth,
         double shrinkPerSpace, List<string> output)

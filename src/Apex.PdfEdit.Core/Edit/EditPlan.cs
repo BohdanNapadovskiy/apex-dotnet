@@ -110,6 +110,11 @@ public sealed class EditPlan
 /// line. When it is below the font's natural space width the source justifier compressed
 /// spaces to fit one more word; the writer then allows the same compression when it
 /// re-wraps. NaN means "unknown — never compress".
+///
+/// <see cref="SourceLineWidths"/>: width (pt) of each source line, top to bottom, from the
+/// node's per-line boxes. A CENTER block's line breaks are deliberate (stacked titles);
+/// the writer re-wraps each line to its source width so they survive the edit. Null
+/// when the source has fewer than two lines.
 /// </summary>
 public sealed record SetTextOverlay(
     int Page,
@@ -127,7 +132,8 @@ public sealed record SetTextOverlay(
     IReadOnlyList<TextRun> SourceRuns,
     double SourceLeading = 0,
     double FirstLineX = double.NaN,
-    double SourceMinWordGap = double.NaN)
+    double SourceMinWordGap = double.NaN,
+    IReadOnlyList<double>? SourceLineWidths = null)
 {
     /// <summary>Back-compat: no NextSiblingTopY, no source runs.</summary>
     public SetTextOverlay(int page, double x, double y, double width, double height,

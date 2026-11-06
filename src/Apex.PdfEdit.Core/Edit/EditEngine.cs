@@ -226,7 +226,21 @@ public sealed class EditEngine
             sourceRuns,
             SourceLineGap(geom, target.Page, target.Mcid),
             FirstLineIndentX(target, alignment),
-            SourceMinWordGap(geom, target.Page, target.Mcid)));
+            SourceMinWordGap(geom, target.Page, target.Mcid),
+            SourceLineWidths(target)));
+    }
+
+    /// <summary>Per-line source widths, top to bottom; null for single-line or box-less nodes.</summary>
+    private static IReadOnlyList<double>? SourceLineWidths(TreeNode target)
+    {
+        if (target.Boxes is not { Count: >= 2 } boxes) return null;
+        var widths = new List<double>(boxes.Count);
+        foreach (var b in boxes)
+        {
+            if (b is null || b.Width <= 0) return null;
+            widths.Add(b.Width);
+        }
+        return widths;
     }
 
     /// <summary>

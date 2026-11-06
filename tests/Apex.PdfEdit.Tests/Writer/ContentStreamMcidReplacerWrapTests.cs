@@ -282,6 +282,56 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
     }
 
     [Fact]
+    public void WrapToSourceLineWidthsKeepsStackedTitleBreaks()
+    {
+        // Board Packet p3 H2 shape: each source line narrower than the widest one. A greedy
+        // wrap to the widest width merges lines; the shaped wrap keeps every break.
+        string[] source = { "MINUTES OF THE", "SPECIAL MEETING OF THE", "HOUSING AUTHORITY OF THE COUNTY", "April 11, 2025" };
+        var widths = source.Select(l => (double)_helvetica.GetWidth(l, 12f)).ToList();
+        string edited = string.Join(' ', source).Replace("11", "18");
+
+        ContentStreamMcidReplacer.WrapToSourceLineWidths(edited, _helvetica, 12f, widths)
+            .Should().Equal("MINUTES OF THE", "SPECIAL MEETING OF THE", "HOUSING AUTHORITY OF THE COUNTY", "April 18, 2025");
+        ContentStreamMcidReplacer.WrapText(edited, _helvetica, 12f, (float)widths.Max())
+            .Should().HaveCountLessThan(source.Length, "the plain wrap is what collapsed the title");
+    }
+
+    [Fact]
+    public void WrapToSourceLineWidthsDeclinesWhenTextNeedsMoreLinesThanSource()
+    {
+        var widths = new List<double> { _helvetica.GetWidth("aaa bbb", 12f), _helvetica.GetWidth("ccc", 12f) };
+        ContentStreamMcidReplacer.WrapToSourceLineWidths("aaa bbb ccc ddd", _helvetica, 12f, widths).Should().BeNull();
+        ContentStreamMcidReplacer.WrapToSourceLineWidths("aaa\nbbb", _helvetica, 12f, widths).Should().BeNull();
+        ContentStreamMcidReplacer.WrapToSourceLineWidths("aaa bbb", _helvetica, 12f, new List<double> { 100 }).Should().BeNull();
+    }
+
+    [Fact]
+    public void WrapToSourceLineCountKeepsTheSourceRowCountForReorderedText()
+    {
+        // Board Packet p3 corpus edit: same words, "MINUTES" moved to the end, so the
+        // shaped wrap overflows; the source's 5 rows must still come out as 5, not 3.
+        string[] source = { "MINUTES OF THE", "SPECIAL MEETING OF THE", "BOARD OF COMMISSIONERS OF THE",
+            "HOUSING AUTHORITY OF THE COUNTY OF SANTA BARBARA", "April 11, 2025" };
+        var widths = source.Select(l => (double)_helvetica.GetWidth(l, 12f)).ToList();
+        float bbox = (float)widths.Max();
+        string reordered = string.Join(' ', source).Replace("MINUTES ", "") + " MINUTES";
+
+        ContentStreamMcidReplacer.WrapToSourceLineWidths(reordered, _helvetica, 12f, widths).Should().BeNull();
+        ContentStreamMcidReplacer.WrapText(reordered, _helvetica, 12f, bbox).Should().HaveCountLessThan(5);
+        var lines = ContentStreamMcidReplacer.WrapToSourceLineCount(reordered, _helvetica, 12f, widths, bbox);
+        lines.Should().NotBeNull().And.HaveCount(5);
+        string.Join(' ', lines!).Should().Be(reordered);
+    }
+
+    [Fact]
+    public void WrapToSourceLineCountLeavesShortReplacementOnFewerLines()
+    {
+        var widths = new List<double> { 100, 160, 220, 360, 75 };
+        var lines = ContentStreamMcidReplacer.WrapToSourceLineCount("MINUTES OF THE MEETING", _helvetica, 12f, widths, 360f);
+        lines.Should().ContainSingle("the width floor (mean source line) keeps a short title on one line");
+    }
+
+    [Fact]
     public void SegmentEndLineIndicesMarksLinesBeforeHardBreaks()
     {
         const string text = "one two three four five six\nseven eight\nnine";
