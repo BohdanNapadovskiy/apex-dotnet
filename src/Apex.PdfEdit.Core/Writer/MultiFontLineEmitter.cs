@@ -126,11 +126,14 @@ internal static class MultiFontLineEmitter
     }
 
     /// <summary>
-    /// Try <paramref name="primary"/>, then each pool candidate (registered on the
-    /// page's resources on first use), then <paramref name="fallback"/>. Uses the
-    /// strict outline check so a cmap-only match on a subset that lacks the actual
-    /// glyph outline does NOT win — that leak was the root cause of the customer's
-    /// silent-drop report.
+    /// Try <paramref name="primary"/>, then each pool candidate of the same face
+    /// (registered on the page's resources on first use), then <paramref name="fallback"/>,
+    /// and only when the fallback lacks the glyph too, pool candidates of a different
+    /// weight. Uses the strict outline check so a cmap-only match on a subset that lacks
+    /// the actual glyph outline does NOT win — that leak was the root cause of the
+    /// customer's silent-drop report. The face split keeps a stray glyph from turning
+    /// bold mid-word when the weight-matched system font has it (Feedback 1.4 Sample2:
+    /// 'L' / 'B' / '-' pulled from Arial,BoldItalic inside a regular-italic Note).
     /// </summary>
     internal static PdfFont PickFontForChar(string ch, PdfFont primary,
         IReadOnlyList<PdfFont> pool, PdfFont fallback, PageFontInventory inv, PdfPage page)
@@ -138,7 +141,17 @@ internal static class MultiFontLineEmitter
         if (inv.CanRenderStrict(primary, ch)) return primary;
         foreach (var candidate in pool)
         {
-            if (ReferenceEquals(candidate, primary)) continue;
+            if (ReferenceEquals(candidate, primary) || !PageFontInventory.SameFace(candidate, primary)) continue;
+            if (inv.CanRenderStrict(candidate, ch))
+            {
+                EnsureFontRegistered(page, candidate);
+                return candidate;
+            }
+        }
+        if (ReferenceEquals(fallback, primary) || PageFontInventory.CanRender(fallback, ch)) return fallback;
+        foreach (var candidate in pool)
+        {
+            if (ReferenceEquals(candidate, primary) || PageFontInventory.SameFace(candidate, primary)) continue;
             if (inv.CanRenderStrict(candidate, ch))
             {
                 EnsureFontRegistered(page, candidate);

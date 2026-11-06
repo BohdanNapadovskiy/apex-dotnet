@@ -234,12 +234,17 @@ public sealed class PageFontInventory
     /// through different twins, each holding a disjoint glyph subset. The writer
     /// walks this list and picks the first entry where <see cref="CanRender"/>
     /// is true for the new content.
+    /// Slant is a hard filter, not a preference: an italic request never yields an
+    /// upright face (and vice versa). <see cref="FamilyStem"/> drops the ",Italic"
+    /// suffix, so without it chars missing from the italic subset fell through to the
+    /// page's upright Arial / Arial,Bold twins (Feedback 1.4 Sample2 p1 Note).
     /// </summary>
     public IReadOnlyList<PdfFont> CandidatesByFamilyAndWeight(string? family, string? weight)
     {
         if (string.IsNullOrWhiteSpace(family)) return Array.Empty<PdfFont>();
         var target = FamilyStem(family);
         bool wantBold = string.Equals(weight, "bold", StringComparison.OrdinalIgnoreCase);
+        bool wantItalic = IsItalicName(family);
 
         var weightSimple = new List<PdfFont>();
         var weightType0 = new List<PdfFont>();
@@ -249,6 +254,7 @@ public sealed class PageFontInventory
         {
             var baseName = BaseFontName(f);
             if (!string.Equals(target, FamilyStem(baseName), StringComparison.Ordinal)) continue;
+            if (IsItalicName(baseName) != wantItalic) continue;
             bool simple = !IsType0(f);
             bool weightOk = wantBold == IsBold(f, baseName);
             if (weightOk && simple) weightSimple.Add(f);
@@ -313,6 +319,7 @@ public sealed class PageFontInventory
         if (doc is null || string.IsNullOrWhiteSpace(family)) return Array.Empty<PdfFont>();
         var target = FamilyStem(family);
         bool wantBold = string.Equals(weight, "bold", StringComparison.OrdinalIgnoreCase);
+        bool wantItalic = IsItalicName(family);
 
         var byObj = new Dictionary<int, PdfFont>();
         int pageCount = doc.GetNumberOfPages();
@@ -323,7 +330,9 @@ public sealed class PageFontInventory
                 var pi = Of(doc.GetPage(p));
                 foreach (var f in pi._fonts.Values)
                 {
-                    if (!string.Equals(target, FamilyStem(BaseFontName(f)), StringComparison.Ordinal)) continue;
+                    var baseName = BaseFontName(f);
+                    if (!string.Equals(target, FamilyStem(baseName), StringComparison.Ordinal)) continue;
+                    if (IsItalicName(baseName) != wantItalic) continue;
                     var refr = f.GetPdfObject()?.GetIndirectReference();
                     if (refr is null) continue;
                     byObj.TryAdd(refr.GetObjNumber(), f);
@@ -459,6 +468,25 @@ public sealed class PageFontInventory
         int dash = s.IndexOf('-');
         if (dash >= 0) s = s[..dash];
         return s.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// True when a font / family name advertises a slanted face ("Arial,Italic",
+    /// "Arial-ItalicMT", "Helvetica-Oblique", "Arial,BoldItalic").
+    /// </summary>
+    internal static bool IsItalicName(string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        return name.Contains("italic", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("oblique", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>True when both fonts share weight class (bold vs not) and slant.</summary>
+    internal static bool SameFace(PdfFont a, PdfFont b)
+    {
+        var an = BaseFontName(a);
+        var bn = BaseFontName(b);
+        return IsBold(a, an) == IsBold(b, bn) && IsItalicName(an) == IsItalicName(bn);
     }
 
     private static bool IsBold(PdfFont font, string? baseName)
