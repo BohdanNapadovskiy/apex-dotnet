@@ -39,22 +39,6 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
     private readonly Dictionary<string, IList<PdfObject>> _preservedStateOps = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Cumulative text-matrix offset (Td/TD/T*) applied inside the currently-active
-    /// deleted block. Replayed after EMC as a single <c>dx dy Td</c> so downstream MCIDs
-    /// sharing the outer BT/ET see the same text matrix they would have without the delete.
-    /// </summary>
-    private double _dxInsideBlock;
-
-    private double _dyInsideBlock;
-
-    private bool _tmInsideBlock;
-
-    /// <summary>Current leading, tracked only for T* inside the deleted block.</summary>
-    private double? _leadingInsideBlock;
-
-    private bool _tStarWithUnknownLeading;
-
-    /// <summary>
     /// BT/ET nesting depth. Zero means we're not inside a text object; incremented on BT,
     /// decremented on ET. Snapshot at BDC entry so we know whether the block is inside an
     /// outer BT (compensation matters) or opens its own (doesn't).
@@ -131,11 +115,6 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
                 // Enter skip mode — drop BDC, everything inside, and the closing EMC.
                 _activeTargetMcid = mcid;
                 _preservedStateOps.Clear();
-                _dxInsideBlock = 0;
-                _dyInsideBlock = 0;
-                _tmInsideBlock = false;
-                _leadingInsideBlock = null;
-                _tStarWithUnknownLeading = false;
                 _btDepthAtBlockEntry = _btDepth;
                 return;
             }
@@ -145,17 +124,14 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
         if ("EMC".Equals(opName, StringComparison.Ordinal) && _activeTargetMcid >= 0)
         {
             // End of the block we're skipping — emit preserved text-state ops so downstream
-            // MCIDs that inherit state (font, render mode, spacing) still work. Then replay
-            // the block's cumulative text-matrix offset. q/Q/cm/gs were already emitted
-            // in place (see below), so no stack compensation is needed here.
-            int deletedMcid = _activeTargetMcid;
+            // MCIDs that inherit state (font, render mode, spacing) still work. Positioning
+            // ops and q/Q/cm/gs were already emitted in place (see below).
             _activeTargetMcid = -1;
             foreach (var stateOp in _preservedStateOps.Values)
             {
                 WriteOperandsAndOperator(stateOp);
             }
             _preservedStateOps.Clear();
-            EmitTextMatrixCompensation(deletedMcid);
             return;
         }
         if (_activeTargetMcid >= 0)
@@ -180,31 +156,25 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
             }
             else if ("BT".Equals(opName, StringComparison.Ordinal))
             {
+                // Self-contained BT inside the block: its text matrix dies with its ET,
+                // so nothing it positions can affect downstream MCIDs — drop it all.
                 _btDepth++;
-                // Self-contained BT inside the block resets the text matrix on ET,
-                // so any Td/TD/T* accumulated here won't leak downstream. Clear.
-                _dxInsideBlock = 0;
-                _dyInsideBlock = 0;
-                _tmInsideBlock = false;
-                _leadingInsideBlock = null;
-                _tStarWithUnknownLeading = false;
             }
             else if ("ET".Equals(opName, StringComparison.Ordinal))
             {
                 _btDepth--;
-                if (_btDepth <= _btDepthAtBlockEntry)
-                {
-                    _dxInsideBlock = 0;
-                    _dyInsideBlock = 0;
-                    _tmInsideBlock = false;
-                    _leadingInsideBlock = null;
-                    _tStarWithUnknownLeading = false;
-                }
             }
             else if (_btDepth == _btDepthAtBlockEntry && _btDepth > 0)
             {
-                // Only track text-matrix moves at the SAME BT-depth as at block entry.
-                TrackTextMatrixOp(opName, operands);
+                // Text-positioning ops at the outer BT's depth pass through VERBATIM: they
+                // paint nothing, and replaying them in place keeps every downstream MCID
+                // on its source position — including blocks with an absolute Tm, where the
+                // old Td-sum compensation had to give up (Board Packet p3: deleting
+                // "Resolution No. 4095", whose block resets Tm mid-paragraph, pulled the
+                // relatively-positioned ADJOURNMENT heading and the first half of its
+                // paragraph up 4 lines, while the second half — re-anchored by its own Tm —
+                // stayed put, splitting "second|ed"). Diverges from Java — PORTING_PLAN §9.
+                EmitPositioningOp(opName, operands);
             }
             return;
         }
@@ -214,87 +184,38 @@ internal sealed class ContentStreamMcidDeleter : PdfCanvasProcessor
     }
 
     /// <summary>
-    /// Update cumulative Td/TD/T* offset and leading tracking for text-matrix ops seen
-    /// inside the deleted block at the same BT-depth as at block entry.
+    /// Re-emit the line-positioning effect of a text op from inside a deleted block.
+    /// <c>Tm</c>/<c>Td</c>/<c>TD</c>/<c>T*</c>/<c>TL</c> go out unchanged; the show-and-move
+    /// ops keep only their move: <c>'</c> → <c>T*</c>, <c>"</c> → <c>aw Tw ac Tc T*</c>
+    /// (its spacing operands persist past the block, as they would in the source).
+    /// Everything else (glyph painting, inline state) is dropped.
     /// </summary>
-    private void TrackTextMatrixOp(string opName, IList<PdfObject> operands)
+    private void EmitPositioningOp(string opName, IList<PdfObject> operands)
     {
         switch (opName)
         {
-            case "Td":
-                if (operands.Count >= 2)
-                {
-                    _dxInsideBlock += ((PdfNumber)operands[0]).DoubleValue();
-                    _dyInsideBlock += ((PdfNumber)operands[1]).DoubleValue();
-                }
+            case "Tm" or "Td" or "TD" or "T*" or "TL":
+                WriteOperandsAndOperator(operands);
                 break;
-            case "TD":
-                if (operands.Count >= 2)
-                {
-                    double tx = ((PdfNumber)operands[0]).DoubleValue();
-                    double ty = ((PdfNumber)operands[1]).DoubleValue();
-                    _dxInsideBlock += tx;
-                    _dyInsideBlock += ty;
-                    _leadingInsideBlock = -ty;
-                }
+            case "'":
+                WriteRaw("T*");
                 break;
-            case "T*":
-                if (_leadingInsideBlock is { } lead)
+            case "\"":
+                if (operands.Count >= 3)
                 {
-                    _dyInsideBlock -= lead;
+                    WriteOperandsAndOperator(new List<PdfObject> { operands[0], new PdfLiteral("Tw") });
+                    WriteOperandsAndOperator(new List<PdfObject> { operands[1], new PdfLiteral("Tc") });
+                    _preservedStateOps.Remove("Tw");
+                    _preservedStateOps.Remove("Tc");
                 }
-                else
-                {
-                    _tStarWithUnknownLeading = true;
-                }
-                break;
-            case "Tm":
-                _tmInsideBlock = true;
-                break;
-            case "TL":
-                if (operands.Count > 0)
-                {
-                    _leadingInsideBlock = ((PdfNumber)operands[0]).DoubleValue();
-                }
+                WriteRaw("T*");
                 break;
         }
     }
 
-    /// <summary>
-    /// Emit <c>dx dy Td</c> to replay the deleted block's cumulative text-matrix shift
-    /// for downstream MCIDs sharing the outer BT/ET. Skips compensation (with a warning)
-    /// when Tm was used inside the block or when T* fired without a known leading.
-    /// Skips silently when there's no offset to replay or we're not inside an outer BT.
-    /// </summary>
-    private void EmitTextMatrixCompensation(int deletedMcid)
+    private void WriteRaw(string op)
     {
-        bool insideOuterBt = _btDepth > 0;
-        if (!insideOuterBt) return;
-        if (_tmInsideBlock)
-        {
-            _log.LogWarning(
-                "deleteNode MCID {Mcid}: Tm inside deleted block — skipping text-matrix compensation, downstream text position may drift",
-                deletedMcid);
-            return;
-        }
-        if (_tStarWithUnknownLeading)
-        {
-            _log.LogWarning(
-                "deleteNode MCID {Mcid}: T* inside deleted block without a known leading — skipping text-matrix compensation, downstream text position may drift",
-                deletedMcid);
-            return;
-        }
-        if (_dxInsideBlock == 0 && _dyInsideBlock == 0) return;
-        WriteTdOp(_dxInsideBlock, _dyInsideBlock);
-    }
-
-    private void WriteTdOp(double dx, double dy)
-    {
-        _out.Write(new PdfNumber(dx));
-        _out.WriteSpace();
-        _out.Write(new PdfNumber(dy));
-        _out.WriteSpace();
-        _out.WriteBytes(Encoding.ASCII.GetBytes("Td"));
+        _out.WriteBytes(Encoding.ASCII.GetBytes(op));
         _out.WriteNewLine();
     }
 
