@@ -695,9 +695,28 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             var segmentEnds = justifyLines
                 ? SegmentEndLineIndices(overlay.NewContent, font, fontSize, bboxWidth, spaceShrink, lines.Count)
                 : null;
+            // Source inline runs (bold "MOTION by" inside a regular paragraph) that survive
+            // verbatim keep their own face on multi-line edits too — not only single-line ones.
+            var styledLines = _pageFontInventory is not null && lines.Count > 1 && overlay.NewContent is { } newText
+                ? SegmentLines(newText, lines, overlay.SourceRuns, style!)
+                : null;
+            var runFonts = new Dictionary<FontStyle, (PdfFont Font, IReadOnlyList<PdfFont> Pool, PdfFont Fallback)>();
+            (PdfFont Font, IReadOnlyList<PdfFont> Pool, PdfFont Fallback) FontsFor(FontStyle s)
+            {
+                if (ReferenceEquals(s, style)) return (font, pool, universalFallback);
+                if (runFonts.TryGetValue(s, out var cached)) return cached;
+                var f = ResolveRunFont(s, font);
+                var p = !string.IsNullOrWhiteSpace(s.Family)
+                    ? _pageFontInventory!.CandidatesByFamilyAndWeight(s.Family, s.Weight)
+                    : pool;
+                var fb = (_fontCache is not null ? _fontCache.LoadUniversalFallback(s) : SystemFontLocator.LoadUniversalFallback(s))
+                    ?? universalFallback;
+                return runFonts[s] = (f, p, fb);
+            }
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
+                var segs = styledLines?[i];
                 // Per-line justification amount (points of extra advance per word gap).
                 // JustifiedTw already returns 0 on the last line and on lines that already
                 // fill the bbox; we invert its sign here so a POSITIVE extraPt becomes a
@@ -706,10 +725,17 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 float lineBboxWidth = LineBboxWidth(overlay, bboxWidth, i);
                 // Measure with the fonts the emitter will really use per char, so fallback
                 // glyphs don't skew the slack.
-                double? glyphWidth = justifyLines && _pageFontInventory is not null
-                    ? MultiFontLineEmitter.MeasureLine(line, font, pool, universalFallback,
-                        fontSize, _pageFontInventory, _currentPage)
-                    : null;
+                double? glyphWidth = null;
+                if (justifyLines && _pageFontInventory is not null)
+                {
+                    glyphWidth = 0.0;
+                    foreach (var seg in segs ?? new List<InlineSegment> { new(line, style!) })
+                    {
+                        var (sf, sp, sfb) = FontsFor(seg.Style);
+                        glyphWidth += MultiFontLineEmitter.MeasureLine(seg.Text, sf, sp, sfb,
+                            fontSize, _pageFontInventory, _currentPage);
+                    }
+                }
                 double extraSpacePt = justifyLines
                     ? JustifiedTw(line, font, fontSize, lineBboxWidth, baseTc, 0.0,
                         i == lines.Count - 1 || segmentEnds!.Contains(i), spaceShrink, glyphWidth)
@@ -720,7 +746,17 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 float lineX = AlignedX(overlay, font, fontSize, line, i);
                 float lineY = baselineY - i * lineHeight;
                 _outCanvas.SetTextMatrix(lineX, lineY);
-                if (_pageFontInventory is not null)
+                if (segs is not null)
+                {
+                    foreach (var seg in segs)
+                    {
+                        var (sf, sp, sfb) = FontsFor(seg.Style);
+                        EmitFillColorRaw(StandardFontMapper.ParseHex(seg.Style.ColorHex));
+                        MultiFontLineEmitter.EmitLine(_outCanvas, seg.Text, sf, sp,
+                            sfb, fontSize, _pageFontInventory!, _currentPage, tjAdj);
+                    }
+                }
+                else if (_pageFontInventory is not null)
                 {
                     MultiFontLineEmitter.EmitLine(_outCanvas, line, font, pool,
                         universalFallback, fontSize, _pageFontInventory, _currentPage, tjAdj);
@@ -1220,9 +1256,19 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     internal sealed record InlineSegment(string Text, FontStyle Style);
 
     /// <summary>
-    /// Decompose <paramref name="line"/> into inline segments, tagging any substring that
-    /// appears verbatim in a source <see cref="TextRun"/> with that run's style. Unmatched
-    /// gaps get the <paramref name="primary"/> style. Runs are matched in source order.
+    /// Decompose <paramref name="line"/> into inline segments, carrying source styling over
+    /// WORD BY WORD: each source word takes the style of its characters, the longest common
+    /// word subsequence (ordinal, order-preserving) aligns source and new words, and every
+    /// new word that aligns keeps its source word's style. Inserted or moved words get the
+    /// <paramref name="primary"/> style; the space between two aligned words that were also
+    /// adjacent in the source keeps the source space's style.
+    ///
+    /// Word-level, not run-level: an edit that changes part of a styled run keeps the rest
+    /// (Board Packet p5: "Resolution No. 4098" is a bold lead-in; the edit moved
+    /// "Resolution" to the end, so "No. 4098" stays bold and the trailing "Resolution" is
+    /// regular). Order-preserving alignment also tells a repeated phrase's occurrences
+    /// apart — the regular "approve Resolution No. 4098." mid-sentence aligns with its own
+    /// regular source occurrence, not the bold lead-in.
     /// </summary>
     internal static List<InlineSegment> SegmentByRuns(string? line, IReadOnlyList<TextRun>? sourceRuns, FontStyle primary)
     {
@@ -1230,39 +1276,134 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         {
             return new List<InlineSegment> { new(line ?? string.Empty, primary) };
         }
-        var matches = new List<(int Start, int End, int RunIndex)>();
-        int searchFrom = 0;
-        for (int i = 0; i < sourceRuns.Count; i++)
+        var src = new StringBuilder();
+        var srcStyle = new List<FontStyle>();
+        foreach (var run in sourceRuns)
         {
-            var run = sourceRuns[i];
-            var needle = run.Text;
-            if (string.IsNullOrEmpty(needle)) continue;
-            int at = line.IndexOf(needle, searchFrom, StringComparison.Ordinal);
-            if (at < 0) continue;
-            matches.Add((at, at + needle.Length, i));
-            searchFrom = at + needle.Length;
+            var st = NormalizeRunStyle(run.Style, primary);
+            src.Append(run.Text);
+            for (int k = 0; k < run.Text.Length; k++) srcStyle.Add(st);
         }
-        if (matches.Count == 0)
+        string source = src.ToString();
+        var sw = WordSpans(source);
+        var nw = WordSpans(line);
+
+        // LCS over word texts.
+        int n = sw.Count, m = nw.Count;
+        bool SameWord(int i, int j) => sw[i].Length == nw[j].Length
+            && string.CompareOrdinal(source, sw[i].Start, line, nw[j].Start, sw[i].Length) == 0;
+        var lcs = new int[n + 1, m + 1];
+        for (int i = n - 1; i >= 0; i--)
         {
-            return new List<InlineSegment> { new(line, primary) };
-        }
-        var output = new List<InlineSegment>();
-        int cursor = 0;
-        foreach (var m in matches)
-        {
-            if (m.Start > cursor) output.Add(new InlineSegment(line[cursor..m.Start], primary));
-            var runStyle = sourceRuns[m.RunIndex].Style;
-            if (runStyle.Size < 4.0f && primary.Size >= 4.0f)
+            for (int j = m - 1; j >= 0; j--)
             {
-                runStyle = new FontStyle(runStyle.Family, primary.Size,
-                    runStyle.Weight, runStyle.ColorHex,
-                    runStyle.SourceFontObjNumber, runStyle.LeadingRatio);
+                lcs[i, j] = SameWord(i, j)
+                    ? lcs[i + 1, j + 1] + 1
+                    : Math.Max(lcs[i + 1, j], lcs[i, j + 1]);
             }
-            output.Add(new InlineSegment(line[m.Start..m.End], runStyle));
-            cursor = m.End;
         }
-        if (cursor < line.Length) output.Add(new InlineSegment(line[cursor..], primary));
+
+        var charStyle = new FontStyle[line.Length];
+        Array.Fill(charStyle, primary);
+        int si = 0, ni = 0, prevS = -2, prevN = -2;
+        while (si < n && ni < m)
+        {
+            if (SameWord(si, ni) && lcs[si, ni] == lcs[si + 1, ni + 1] + 1)
+            {
+                var st = srcStyle[sw[si].Start];
+                for (int k = 0; k < nw[ni].Length; k++) charStyle[nw[ni].Start + k] = st;
+                // Gap between two aligned words that were adjacent in the source too.
+                if (prevS == si - 1 && prevN == ni - 1 && sw[si].Start > sw[prevS].End)
+                {
+                    var gapStyle = srcStyle[sw[prevS].End];
+                    for (int k = nw[prevN].End; k < nw[ni].Start; k++) charStyle[k] = gapStyle;
+                }
+                prevS = si++;
+                prevN = ni++;
+            }
+            else if (lcs[si + 1, ni] >= lcs[si, ni + 1]) si++;
+            else ni++;
+        }
+
+        var output = new List<InlineSegment>();
+        int segStart = 0;
+        for (int k = 1; k <= line.Length; k++)
+        {
+            if (k == line.Length || !charStyle[k].Equals(charStyle[segStart]))
+            {
+                output.Add(new InlineSegment(line[segStart..k], charStyle[segStart]));
+                segStart = k;
+            }
+        }
         return output;
+    }
+
+    /// <summary>
+    /// A run's style as a segment style: the <paramref name="primary"/> instance itself when
+    /// they differ only in leading (captured per text event — not a face difference), and
+    /// the primary's size when the run's own size is unknown (Tf 1 + Tm-scaled producers).
+    /// </summary>
+    private static FontStyle NormalizeRunStyle(FontStyle runStyle, FontStyle primary)
+    {
+        if ((runStyle with { LeadingRatio = primary.LeadingRatio }).Equals(primary)) return primary;
+        if (runStyle.Size < 4.0f && primary.Size >= 4.0f)
+        {
+            runStyle = runStyle with { Size = primary.Size };
+            if ((runStyle with { LeadingRatio = primary.LeadingRatio }).Equals(primary)) return primary;
+        }
+        return runStyle;
+    }
+
+    /// <summary>Non-whitespace word spans of <paramref name="text"/>.</summary>
+    private static List<(int Start, int Length, int End)> WordSpans(string text)
+    {
+        var spans = new List<(int, int, int)>();
+        int i = 0;
+        while (i < text.Length)
+        {
+            while (i < text.Length && char.IsWhiteSpace(text[i])) i++;
+            int start = i;
+            while (i < text.Length && !char.IsWhiteSpace(text[i])) i++;
+            if (i > start) spans.Add((start, i - start, i));
+        }
+        return spans;
+    }
+
+    /// <summary>
+    /// Per-line inline segments for a multi-line replacement: <see cref="SegmentByRuns"/>
+    /// over the WHOLE new text (a source run can straddle a wrap point), sliced at each
+    /// wrapped line's span. Null when no surviving run differs from <paramref name="primary"/>
+    /// or a line can't be located in the text (callers then emit lines in one style).
+    /// </summary>
+    internal static List<List<InlineSegment>>? SegmentLines(string text, IReadOnlyList<string> lines,
+        IReadOnlyList<TextRun>? sourceRuns, FontStyle primary)
+    {
+        var whole = SegmentByRuns(text, sourceRuns, primary);
+        if (whole.All(s => s.Style.Equals(primary))) return null;
+        var spans = new List<(int Start, int End, FontStyle Style)>();
+        int pos = 0;
+        foreach (var seg in whole)
+        {
+            spans.Add((pos, pos + seg.Text.Length, seg.Style));
+            pos += seg.Text.Length;
+        }
+        var result = new List<List<InlineSegment>>(lines.Count);
+        int cursor = 0;
+        foreach (var line in lines)
+        {
+            int start = line.Length == 0 ? cursor : text.IndexOf(line, cursor, StringComparison.Ordinal);
+            if (start < 0) return null;
+            int end = start + line.Length;
+            var lineSegs = new List<InlineSegment>();
+            foreach (var (s, e, st) in spans)
+            {
+                int a = Math.Max(s, start), b = Math.Min(e, end);
+                if (a < b) lineSegs.Add(new InlineSegment(text[a..b], st));
+            }
+            result.Add(lineSegs);
+            cursor = end;
+        }
+        return result;
     }
 
     /// <summary>

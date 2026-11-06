@@ -214,7 +214,10 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
         var b = new FontStyle("B", 10f, "regular", "#000000");
         var sourceRuns = new List<TextRun> { new("first", a), new("second", b) };
         var segs = ContentStreamMcidReplacer.SegmentByRuns("second then first", sourceRuns, a);
-        segs.Select(s => s.Text).Should().Equal("second then ", "first");
+        // The two words swapped order: an order-preserving alignment can keep at most one,
+        // so "second" can't both keep style B and have "first" aligned after it.
+        string.Concat(segs.Select(s => s.Text)).Should().Be("second then first");
+        segs.Count(s => s.Style == b).Should().BeLessThanOrEqualTo(1);
     }
 
     [Fact]
@@ -329,6 +332,52 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
         var widths = new List<double> { 100, 160, 220, 360, 75 };
         var lines = ContentStreamMcidReplacer.WrapToSourceLineCount("MINUTES OF THE MEETING", _helvetica, 12f, widths, 360f);
         lines.Should().ContainSingle("the width floor (mean source line) keeps a short title on one line");
+    }
+
+    private static readonly FontStyle Regular = new("TimesNewRomanPSMT", 12f, "regular", "#000000");
+    private static readonly FontStyle Bold = new("TimesNewRomanPS-BoldMT", 12f, "bold", "#000000");
+
+    [Fact]
+    public void SegmentByRunsKeepsUnchangedWordsOfAStyledRunAndDropsMovedOnes()
+    {
+        // Board Packet p5: bold lead-in "Resolution No. 4098"; the edit moved "Resolution"
+        // to the end. "No. 4098" is unchanged → stays bold; the trailing "Resolution" and
+        // the regular mid-sentence "Resolution No. 4098." stay regular; "MOTION by" bold.
+        var runs = new List<TextRun>
+        {
+            new("Resolution No. 4098", Bold),
+            new(" - Payment Standards. ", Regular),
+            new("MOTION by", Bold),
+            new(" Commissioner Alonso to approve Resolution No. 4098.", Regular),
+        };
+        var segs = ContentStreamMcidReplacer.SegmentByRuns(
+            "No. 4098 - Payment Standards MOTION by Commissioner Alonso to approve Resolution No. 4098. Resolution",
+            runs, Regular);
+
+        segs.Where(s => s.Style == Bold).Select(s => s.Text).Should().Equal("No. 4098", "MOTION by");
+        string.Concat(segs.Select(s => s.Text)).Should().EndWith("approve Resolution No. 4098. Resolution");
+    }
+
+    [Fact]
+    public void SegmentLinesSlicesRunsAcrossWrappedLines()
+    {
+        var runs = new List<TextRun> { new("Lead in", Bold), new(" body text here", Regular) };
+        const string text = "Lead in body text here";
+        var lines = new[] { "Lead", "in body", "text here" };
+
+        var perLine = ContentStreamMcidReplacer.SegmentLines(text, lines, runs, Regular);
+
+        perLine.Should().NotBeNull().And.HaveCount(3);
+        perLine![0].Should().ContainSingle().Which.Should().Be(new ContentStreamMcidReplacer.InlineSegment("Lead", Bold));
+        perLine[1].Select(s => (s.Text, s.Style == Bold)).Should().Equal(("in", true), (" body", false));
+        perLine[2].Should().OnlyContain(s => s.Style == Regular);
+    }
+
+    [Fact]
+    public void SegmentLinesIsNullWhenNoRunChangesStyle()
+    {
+        var runs = new List<TextRun> { new("abc", Regular), new(" def", Regular) };
+        ContentStreamMcidReplacer.SegmentLines("abc def", new[] { "abc", "def" }, runs, Regular).Should().BeNull();
     }
 
     [Fact]

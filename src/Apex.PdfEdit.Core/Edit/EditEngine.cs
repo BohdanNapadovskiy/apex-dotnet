@@ -202,13 +202,13 @@ public sealed class EditEngine
 
         target.Content = op.NewContent;
 
-        var style = ResolveStyle(target.Page, target.Mcid);
         var alignment = alignmentByNode.TryGetValue(op.Target, out var a) ? a : Alignment.Left;
         double glyphBaselineY = GlyphBaselineY(geom, target.Page, target.Mcid);
         double nextSiblingTopY = NextSiblingTopBelow(nodesByPage, target);
         var sourceRuns = _fontResolver is null
             ? (IReadOnlyList<Writer.TextRun>)Array.Empty<Writer.TextRun>()
             : _fontResolver.ResolveRuns(target.Page, target.Mcid);
+        var style = DominantRunStyle(ResolveStyle(target.Page, target.Mcid), sourceRuns);
 
         plan.SetText(new SetTextOverlay(
             target.Page,
@@ -228,6 +228,30 @@ public sealed class EditEngine
             FirstLineIndentX(target, alignment),
             SourceMinWordGap(geom, target.Page, target.Mcid),
             SourceLineWidths(target)));
+    }
+
+    /// <summary>
+    /// Base style for a replacement: the source run covering the most visible characters,
+    /// not the block's FIRST run. A paragraph that opens with a bold lead-in ("Resolution
+    /// No. 4098 – …" on Board Packet p5) otherwise re-renders entirely in bold — wider, so
+    /// it also wrapped one line longer and ran into the next paragraph. Keeps the primary's
+    /// leading ratio (resolved across the whole block) and its size when the run's is unset.
+    /// </summary>
+    internal static FontStyle DominantRunStyle(FontStyle primary, IReadOnlyList<Writer.TextRun>? runs)
+    {
+        if (runs is not { Count: >= 2 }) return primary;
+        var weightByStyle = new Dictionary<FontStyle, int>();
+        foreach (var run in runs)
+        {
+            // Leading is captured per text-render event; it says nothing about the face.
+            var key = run.Style with { LeadingRatio = 0f };
+            int visible = run.Text.Count(c => !char.IsWhiteSpace(c));
+            weightByStyle[key] = weightByStyle.GetValueOrDefault(key) + visible;
+        }
+        var best = weightByStyle.MaxBy(kv => kv.Value).Key;
+        if (best.Equals(primary with { LeadingRatio = 0f })) return primary;
+        return new FontStyle(best.Family, best.Size >= 4.0f ? best.Size : primary.Size, best.Weight,
+            best.ColorHex, best.SourceFontObjNumber, primary.LeadingRatio);
     }
 
     /// <summary>Per-line source widths, top to bottom; null for single-line or box-less nodes.</summary>

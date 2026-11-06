@@ -1473,4 +1473,34 @@ public sealed class EditEngineTests
         EditEngine.FirstLineIndentX(title, Alignment.Center).Should().Be(double.NaN);
         EditEngine.FirstLineIndentX(title, Alignment.Unknown).Should().Be(double.NaN);
     }
+
+    [Fact]
+    public void DominantRunStyleIgnoresABoldLeadIn()
+    {
+        // Board Packet p5 node 190: first run is the bold "Resolution No. 4098", but the
+        // paragraph body is regular — the replacement must not render all-bold.
+        var bold = new FontStyle("TimesNewRomanPS-BoldMT", 12f, "bold", "#000000", 11, 1.15f);
+        var regular = new FontStyle("TimesNewRomanPSMT", 12f, "regular", "#000000", 12, 0f);
+        var runs = new List<Apex.PdfEdit.Core.Writer.TextRun>
+        {
+            new Apex.PdfEdit.Core.Writer.TextRun("Resolution No. 4098", bold),
+            new Apex.PdfEdit.Core.Writer.TextRun(" - 2025 Payment Standards. ", regular),
+            new Apex.PdfEdit.Core.Writer.TextRun("MOTION by", bold),
+            new Apex.PdfEdit.Core.Writer.TextRun(" Commissioner Alonso, seconded by Commissioner Mercado.", regular),
+        };
+
+        var style = EditEngine.DominantRunStyle(bold, runs);
+
+        style.Weight.Should().Be("regular");
+        style.SourceFontObjNumber.Should().Be(12);
+        style.LeadingRatio.Should().Be(1.15f, "leading comes from the block, not the run");
+    }
+
+    [Fact]
+    public void DominantRunStyleKeepsPrimaryForSingleRun()
+    {
+        var primary = new FontStyle("Arial", 10f, "regular", "#000000");
+        EditEngine.DominantRunStyle(primary, new List<Apex.PdfEdit.Core.Writer.TextRun> { new Apex.PdfEdit.Core.Writer.TextRun("x", primary with { Weight = "bold" }) })
+            .Should().BeSameAs(primary);
+    }
 }
