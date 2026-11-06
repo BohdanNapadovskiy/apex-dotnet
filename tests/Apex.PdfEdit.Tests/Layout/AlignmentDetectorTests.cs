@@ -76,6 +76,39 @@ public sealed class AlignmentDetectorTests
         ((double)max / total).Should().BeLessThan(0.98);
     }
 
+    [Fact]
+    public void LinesSharingAMidpointClassifyAsCenterOffThePageAxis()
+    {
+        // Board Packet p3 H2: every line centered at x≈306 while the page's body margins put
+        // the page center at 301.5 — 4.3pt off, outside the 3pt tolerance, so the union-bbox
+        // test alone said UNKNOWN and the edit re-flowed left.
+        var title = Node("title", 124.8, 362.1, 72);
+        title.Boxes = new List<TreeBox>
+        {
+            Box(254.0, 104.0), Box(225.4, 161.0), Box(196.6, 218.8), Box(124.8, 362.1), Box(269.8, 75.4)
+        };
+        var doc = new DocumentJson
+        {
+            Tree = { Node("body1", 72, 459, 50), Node("body2", 72, 459, 50), Node("body3", 72, 400, 50), title }
+        };
+
+        new AlignmentDetector().Detect(doc)["title"].Should().Be(Alignment.Center);
+    }
+
+    [Fact]
+    public void SmallFirstLineIndentDoesNotReadAsCenter()
+    {
+        // Sample2 Note shape, two lines: 3.5pt indent on line 0, both lines reach the right
+        // edge → midpoints within 1.75pt, but a 3.5pt left spread is under the 2×tolerance floor.
+        var note = Node("note", 72, 459, 24);
+        note.Boxes = new List<TreeBox> { Box(75.5, 455.5), Box(72, 459) };
+        var doc = new DocumentJson { Tree = { Node("body1", 72, 459, 50), Node("body2", 72, 459, 50), note } };
+
+        new AlignmentDetector().Detect(doc)["note"].Should().Be(Alignment.Justified);
+    }
+
+    private static TreeBox Box(double x, double width) => new() { X = x, Width = width, Height = 12, Page = 1 };
+
     private static TreeNode Node(string id, double x, double width, double height)
     {
         int digits = int.TryParse(new string(id.Where(char.IsDigit).ToArray()), out var m) ? m : 0;

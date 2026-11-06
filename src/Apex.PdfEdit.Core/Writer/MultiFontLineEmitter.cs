@@ -38,10 +38,33 @@ internal static class MultiFontLineEmitter
         PdfFont? primary, IReadOnlyList<PdfFont> pool, PdfFont fallback,
         float fontSize, PageFontInventory inv, PdfPage page)
     {
+        EmitLine(canvas, line, primary, pool, fallback, fontSize, inv, page, 0.0);
+    }
+
+    /// <summary>
+    /// Overload that spreads justification via TJ per-space adjustments instead of
+    /// <c>Tw</c>. <paramref name="tjAdjustmentPer1000"/> is the raw TJ number injected
+    /// after every space glyph — <b>negative</b> to ADD forward advance (positive TJ
+    /// numbers move backward per ISO 32000-1 §9.4.3). Callers who want to add
+    /// <c>extraPt</c> of horizontal advance per word gap pass
+    /// <c>-(extraPt * 1000 / fontSize)</c>. Passing 0 falls through to the plain
+    /// <c>Tj</c> path.
+    ///
+    /// Why not <c>Tw</c>: <c>Tw</c> only acts on single-byte character code 32 per
+    /// spec §9.3.3, which excludes every Type 0 composite font — the common case in
+    /// tagged PDFs — because their strings use 2-byte CIDs (space is <c>0x0003</c>
+    /// in typical Arial subsets, not <c>0x0020</c>). TJ works uniformly for both
+    /// simple and composite fonts.
+    /// </summary>
+    internal static void EmitLine(PdfCanvas canvas, string line,
+        PdfFont? primary, IReadOnlyList<PdfFont> pool, PdfFont fallback,
+        float fontSize, PageFontInventory inv, PdfPage page, double tjAdjustmentPer1000)
+    {
         if (string.IsNullOrEmpty(line)) return;
         if (primary is null)
         {
-            canvas.SetFontAndSize(fallback, fontSize).ShowText(line);
+            canvas.SetFontAndSize(fallback, fontSize);
+            EmitRun(canvas, fallback, line, tjAdjustmentPer1000);
             return;
         }
         var run = new StringBuilder();
@@ -54,7 +77,8 @@ internal static class MultiFontLineEmitter
             current ??= pick;
             if (!ReferenceEquals(pick, current))
             {
-                canvas.SetFontAndSize(current, fontSize).ShowText(run.ToString());
+                canvas.SetFontAndSize(current, fontSize);
+                EmitRun(canvas, current, run.ToString(), tjAdjustmentPer1000);
                 run.Clear();
                 current = pick;
             }
@@ -63,16 +87,76 @@ internal static class MultiFontLineEmitter
         }
         if (run.Length > 0 && current is not null)
         {
-            canvas.SetFontAndSize(current, fontSize).ShowText(run.ToString());
+            canvas.SetFontAndSize(current, fontSize);
+            EmitRun(canvas, current, run.ToString(), tjAdjustmentPer1000);
         }
     }
 
     /// <summary>
-    /// Try <paramref name="primary"/>, then each pool candidate (registered on the
-    /// page's resources on first use), then <paramref name="fallback"/>. Uses the
-    /// strict outline check so a cmap-only match on a subset that lacks the actual
-    /// glyph outline does NOT win — that leak was the root cause of the customer's
-    /// silent-drop report.
+    /// Advance width (pt, no Tc/Tw) of <paramref name="line"/> as <see cref="EmitLine(PdfCanvas, string, PdfFont?, IReadOnlyList{PdfFont}, PdfFont, float, PageFontInventory, PdfPage, double)"/>
+    /// will draw it — each char measured in the font <see cref="PickFontForChar"/> picks.
+    /// Measuring with the primary alone misjudges chars its subset lacks, so a justified
+    /// line holding fallback glyphs stopped short of the right edge (Feedback 1.4 Sample2
+    /// Note line 2: 22pt short).
+    /// </summary>
+    internal static double MeasureLine(string line, PdfFont? primary, IReadOnlyList<PdfFont> pool,
+        PdfFont fallback, float fontSize, PageFontInventory inv, PdfPage page)
+    {
+        if (string.IsNullOrEmpty(line)) return 0.0;
+        if (primary is null) return fallback.GetWidth(line, fontSize);
+        double width = 0.0;
+        for (int i = 0; i < line.Length;)
+        {
+            int cp = char.ConvertToUtf32(line, i);
+            var ch = char.ConvertFromUtf32(cp);
+            width += PickFontForChar(ch, primary, pool, fallback, inv, page).GetWidth(ch, fontSize);
+            i += char.IsHighSurrogate(line[i]) ? 2 : 1;
+        }
+        return width;
+    }
+
+    /// <summary>
+    /// Emit a single-font run. Uses plain <c>Tj</c> when there is no per-space
+    /// adjustment; otherwise builds a TJ array that splits the run at each space
+    /// glyph and injects <paramref name="tjAdjustmentPer1000"/> between the halves.
+    /// </summary>
+    private static void EmitRun(PdfCanvas canvas, PdfFont font, string text, double tjAdjustmentPer1000)
+    {
+        if (text.Length == 0) return;
+        if (tjAdjustmentPer1000 == 0.0 || !text.Contains(' '))
+        {
+            canvas.ShowText(text);
+            return;
+        }
+        var array = new PdfArray();
+        var buf = new StringBuilder();
+        var adj = new PdfNumber(tjAdjustmentPer1000);
+        for (int i = 0; i < text.Length; i++)
+        {
+            buf.Append(text[i]);
+            if (text[i] == ' ')
+            {
+                array.Add(new PdfString(font.ConvertToBytes(buf.ToString())));
+                buf.Clear();
+                array.Add(adj);
+            }
+        }
+        if (buf.Length > 0)
+        {
+            array.Add(new PdfString(font.ConvertToBytes(buf.ToString())));
+        }
+        canvas.ShowText(array);
+    }
+
+    /// <summary>
+    /// Try <paramref name="primary"/>, then each pool candidate of the same face
+    /// (registered on the page's resources on first use), then <paramref name="fallback"/>,
+    /// and only when the fallback lacks the glyph too, pool candidates of a different
+    /// weight. Uses the strict outline check so a cmap-only match on a subset that lacks
+    /// the actual glyph outline does NOT win — that leak was the root cause of the
+    /// customer's silent-drop report. The face split keeps a stray glyph from turning
+    /// bold mid-word when the weight-matched system font has it (Feedback 1.4 Sample2:
+    /// 'L' / 'B' / '-' pulled from Arial,BoldItalic inside a regular-italic Note).
     /// </summary>
     internal static PdfFont PickFontForChar(string ch, PdfFont primary,
         IReadOnlyList<PdfFont> pool, PdfFont fallback, PageFontInventory inv, PdfPage page)
@@ -80,7 +164,17 @@ internal static class MultiFontLineEmitter
         if (inv.CanRenderStrict(primary, ch)) return primary;
         foreach (var candidate in pool)
         {
-            if (ReferenceEquals(candidate, primary)) continue;
+            if (ReferenceEquals(candidate, primary) || !PageFontInventory.SameFace(candidate, primary)) continue;
+            if (inv.CanRenderStrict(candidate, ch))
+            {
+                EnsureFontRegistered(page, candidate);
+                return candidate;
+            }
+        }
+        if (ReferenceEquals(fallback, primary) || PageFontInventory.CanRender(fallback, ch)) return fallback;
+        foreach (var candidate in pool)
+        {
+            if (ReferenceEquals(candidate, primary) || PageFontInventory.SameFace(candidate, primary)) continue;
             if (inv.CanRenderStrict(candidate, ch))
             {
                 EnsureFontRegistered(page, candidate);

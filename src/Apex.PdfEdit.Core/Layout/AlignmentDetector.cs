@@ -110,6 +110,7 @@ public sealed class AlignmentDetector
 
     private Alignment Classify(TreeNode node, double modeLeft, double modeRight)
     {
+        if (LinesShareCenter(node)) return Alignment.Center;
         double left = node.X;
         double right = node.X + node.Width;
         double center = (left + right) / 2.0;
@@ -126,6 +127,32 @@ public sealed class AlignmentDetector
         if (rightAligned && !leftAligned) return Alignment.Right;
         if (leftAligned) return Alignment.Left;
         return Alignment.Unknown;
+    }
+
+    /// <summary>
+    /// Intrinsic CENTER evidence from the node's own per-line boxes: two or more lines whose
+    /// left edges differ by more than twice the tolerance while their midpoints agree within
+    /// it. The page-margin test alone misses a title centered on a slightly different axis
+    /// than the body column (Board Packet p3 H2 "MINUTES OF THE …": every line centered at
+    /// x≈306, page center 301.5 → 4.3pt off → UNKNOWN → re-flowed left). The 2× spread
+    /// floor keeps a justified paragraph with a few-point first-line indent out.
+    /// Not in the Java reference — PORTING_PLAN §9.
+    /// </summary>
+    private bool LinesShareCenter(TreeNode node)
+    {
+        if (node.Boxes is not { Count: >= 2 } boxes) return false;
+        double minLeft = double.PositiveInfinity, maxLeft = double.NegativeInfinity;
+        double minMid = double.PositiveInfinity, maxMid = double.NegativeInfinity;
+        foreach (var b in boxes)
+        {
+            if (b is null || b.Width <= 0) return false;
+            double mid = b.X + b.Width / 2.0;
+            minLeft = Math.Min(minLeft, b.X);
+            maxLeft = Math.Max(maxLeft, b.X);
+            minMid = Math.Min(minMid, mid);
+            maxMid = Math.Max(maxMid, mid);
+        }
+        return maxLeft - minLeft > 2 * _tolerance && maxMid - minMid <= _tolerance;
     }
 
     /// <summary>

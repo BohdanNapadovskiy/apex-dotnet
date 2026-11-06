@@ -224,7 +224,90 @@ public sealed class EditEngine
             glyphBaselineY,
             nextSiblingTopY,
             sourceRuns,
-            SourceLineGap(geom, target.Page, target.Mcid)));
+            SourceLineGap(geom, target.Page, target.Mcid),
+            FirstLineIndentX(target, alignment),
+            SourceMinWordGap(geom, target.Page, target.Mcid)));
+    }
+
+    /// <summary>
+    /// Mean word gap (pt) on the tightest line of the source block, measured from
+    /// geometry.json glyph boxes; NaN when no line has at least two word gaps. A justified
+    /// source paragraph whose tightest line sits BELOW the font's natural space width was
+    /// laid out by a justifier that compresses spaces to fit one more word (Word does);
+    /// re-wrapping at natural spacing then pushes that word down and stretches the line
+    /// it left (Feedback 1.3 Sample2 Note: 2.13pt gaps became 4.87pt). The writer uses
+    /// this to allow the same compression. Not in the Java reference — PORTING_PLAN §9.
+    /// </summary>
+    internal static double SourceMinWordGap(GeometryJson? geom, int page, int mcid)
+    {
+        if (geom is null) return double.NaN;
+        var glyphs = geom.GlyphsFor(page, mcid);
+        double minHeight = double.PositiveInfinity;
+        foreach (var g in glyphs)
+        {
+            if (g.Height > 0 && g.Height < minHeight) minHeight = g.Height;
+        }
+        if (double.IsPositiveInfinity(minHeight)) return double.NaN;
+        // Same row tolerance as SourceLineGap; a word gap is any horizontal gap wider
+        // than a tenth of the glyph height (letter gaps are kerning-sized, ~0).
+        double rowTol = Math.Max(1.0, minHeight * 0.5);
+        double wordGapMin = minHeight * 0.1;
+        var rows = new List<List<Glyph>>();
+        foreach (var g in glyphs)
+        {
+            List<Glyph>? row = null;
+            foreach (var r in rows)
+            {
+                if (Math.Abs(r[0].Y - g.Y) < rowTol) { row = r; break; }
+            }
+            if (row is null) rows.Add(row = new List<Glyph>());
+            row.Add(g);
+        }
+        double tightest = double.NaN;
+        foreach (var row in rows)
+        {
+            row.Sort((l, r) => l.X.CompareTo(r.X));
+            double sum = 0;
+            int count = 0;
+            for (int i = 1; i < row.Count; i++)
+            {
+                double gap = row[i].X - (row[i - 1].X + row[i - 1].Width);
+                if (gap > wordGapMin) { sum += gap; count++; }
+            }
+            if (count < 2) continue;
+            double mean = sum / count;
+            if (double.IsNaN(tightest) || mean < tightest) tightest = mean;
+        }
+        return tightest;
+    }
+
+    /// <summary>
+    /// Line 0 of a source paragraph can sit right of the paragraph margin — e.g. a Note
+    /// paragraph on Ram p1 whose <c>*</c> label is a sibling MCID at X=84.984 and whose
+    /// text starts at X=88.485. <see cref="TreeNode.X"/> is the union bbox left edge
+    /// (min across boxes), which loses that indent. Return line 0's own X so the writer
+    /// can position the first line of the replacement clear of the leading label.
+    /// NaN when there are no per-line boxes or line 0 sits at the union edge.
+    ///
+    /// Only a left-anchored block has an indent: on a CENTER / RIGHT block every line starts
+    /// at its own X, and the later lines of a real indent share one left edge. Without these
+    /// guards a centered title's line 0 start (Board Packet p3 H2: x=254 vs union 124.8)
+    /// was taken as an indent and the replacement's first line began mid-page.
+    /// </summary>
+    internal static double FirstLineIndentX(TreeNode target, Alignment alignment)
+    {
+        if (alignment is Alignment.Center or Alignment.Right) return double.NaN;
+        if (target.Boxes is not { Count: > 0 } boxes) return double.NaN;
+        var first = boxes[0];
+        if (first is null) return double.NaN;
+        // Ignore sub-point drift — box positions coming out of the extractor round to
+        // ~0.001pt but the writer emits at F2/F6, so anything < 0.5pt is noise.
+        if (Math.Abs(first.X - target.X) < 0.5) return double.NaN;
+        for (int i = 1; i < boxes.Count; i++)
+        {
+            if (boxes[i] is { } b && Math.Abs(b.X - target.X) >= 0.5) return double.NaN;
+        }
+        return first.X;
     }
 
     /// <summary>
@@ -232,19 +315,42 @@ public sealed class EditEngine
     /// block is single-line or the gaps are irregular. Lets the writer re-wrap multi-line
     /// replacements at the SOURCE spacing instead of the font's natural leading (PLATO p1:
     /// a double-spaced worksheet paragraph collapsed into tight lines).
+    ///
+    /// Row-clustering tolerance is derived from the SMALLEST glyph height on the block
+    /// rather than a fixed 1pt. Inline styling — bold-italic runs that grow the glyph bbox,
+    /// superscripts, mixed sizes — shifts the bbox-bottom (which is what geometry.json's
+    /// <c>Y</c> field reports) by several points WITHIN a single visual line; a 1pt cutoff
+    /// mistook that shift for a new line (Feedback 1.1 TCC page 4: bold-italic "illicit
+    /// discharge" at Y=517.29 vs surrounding regular text at Y=519.51 registered as 2.22pt
+    /// "leading", so the writer stacked wrapped lines 2.22pt apart and rendered them on
+    /// top of each other).
     /// </summary>
     private static double SourceLineGap(GeometryJson? geom, int page, int mcid)
     {
         if (geom is null) return 0;
-        var ys = new List<double>();
+        double minHeight = double.PositiveInfinity;
+        var raw = new List<double>();
         foreach (var g in geom.GlyphsFor(page, mcid))
         {
+            raw.Add(g.Y);
+            if (g.Height > 0 && g.Height < minHeight) minHeight = g.Height;
+        }
+        if (raw.Count == 0) return 0;
+        // Tolerance: half the smallest glyph height, floored at 1pt. A true new line
+        // sits at least a full glyph height below the previous one; anything closer is
+        // intra-line box-bottom drift from mixed fonts.
+        double tol = double.IsPositiveInfinity(minHeight)
+            ? 1.0
+            : Math.Max(1.0, minHeight * 0.5);
+        var ys = new List<double>();
+        foreach (var y in raw)
+        {
             bool seen = false;
-            foreach (var y in ys)
+            foreach (var existing in ys)
             {
-                if (Math.Abs(y - g.Y) < 1.0) { seen = true; break; }
+                if (Math.Abs(existing - y) < tol) { seen = true; break; }
             }
-            if (!seen) ys.Add(g.Y);
+            if (!seen) ys.Add(y);
         }
         if (ys.Count < 2) return 0;
         ys.Sort();
