@@ -225,7 +225,7 @@ public sealed class EditEngine
             nextSiblingTopY,
             sourceRuns,
             SourceLineGap(geom, target.Page, target.Mcid),
-            FirstLineIndentX(target),
+            FirstLineIndentX(target, alignment),
             SourceMinWordGap(geom, target.Page, target.Mcid)));
     }
 
@@ -288,15 +288,25 @@ public sealed class EditEngine
     /// (min across boxes), which loses that indent. Return line 0's own X so the writer
     /// can position the first line of the replacement clear of the leading label.
     /// NaN when there are no per-line boxes or line 0 sits at the union edge.
+    ///
+    /// Only a left-anchored block has an indent: on a CENTER / RIGHT block every line starts
+    /// at its own X, and the later lines of a real indent share one left edge. Without these
+    /// guards a centered title's line 0 start (Board Packet p3 H2: x=254 vs union 124.8)
+    /// was taken as an indent and the replacement's first line began mid-page.
     /// </summary>
-    private static double FirstLineIndentX(TreeNode target)
+    internal static double FirstLineIndentX(TreeNode target, Alignment alignment)
     {
+        if (alignment is Alignment.Center or Alignment.Right) return double.NaN;
         if (target.Boxes is not { Count: > 0 } boxes) return double.NaN;
         var first = boxes[0];
         if (first is null) return double.NaN;
         // Ignore sub-point drift — box positions coming out of the extractor round to
         // ~0.001pt but the writer emits at F2/F6, so anything < 0.5pt is noise.
         if (Math.Abs(first.X - target.X) < 0.5) return double.NaN;
+        for (int i = 1; i < boxes.Count; i++)
+        {
+            if (boxes[i] is { } b && Math.Abs(b.X - target.X) >= 0.5) return double.NaN;
+        }
         return first.X;
     }
 

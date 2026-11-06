@@ -1441,4 +1441,36 @@ public sealed class EditEngineTests
 
         public ICollection<EventType> GetSupportedEvents() => Supported;
     }
+
+    [Fact]
+    public void FirstLineIndentXKeepsALeftAnchoredIndent()
+    {
+        // Sample2 Note: '*' label left of line 0; lines 1-2 on the union edge.
+        var note = new TreeNode
+        {
+            X = 84.984,
+            Boxes = new List<TreeBox>
+            {
+                new() { X = 88.485, Width = 438.0 }, new() { X = 84.984, Width = 441.7 }, new() { X = 84.984, Width = 35.1 }
+            }
+        };
+        EditEngine.FirstLineIndentX(note, Alignment.Justified).Should().Be(88.485);
+    }
+
+    [Fact]
+    public void FirstLineIndentXIgnoresCenteredLineStarts()
+    {
+        // Board Packet p3 H2: each centered line starts at its own X — line 0's x=254 is not
+        // an indent. Ignored both by alignment and by the later lines not sharing an edge.
+        var title = new TreeNode
+        {
+            X = 124.8,
+            Boxes = new List<TreeBox>
+            {
+                new() { X = 254.0, Width = 104.0 }, new() { X = 225.4, Width = 161.0 }, new() { X = 124.8, Width = 362.1 }
+            }
+        };
+        EditEngine.FirstLineIndentX(title, Alignment.Center).Should().Be(double.NaN);
+        EditEngine.FirstLineIndentX(title, Alignment.Unknown).Should().Be(double.NaN);
+    }
 }
