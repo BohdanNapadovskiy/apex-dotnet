@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using Apex.PdfEdit.Core.Edit;
 using Apex.PdfEdit.Core.Layout;
 using iText.Kernel.Colors;
@@ -47,6 +48,21 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     /// </summary>
     private const float DescenderAdjustRatio = 0.3f;
 
+    /// <summary>
+    /// Upper bound on how much of the natural space width a justified line may give up
+    /// when the source paragraph shows compressed spaces (see <see cref="SpaceShrinkPt"/>).
+    /// Beyond a quarter of the space, words visibly run together.
+    /// </summary>
+    private const double MaxSpaceShrinkRatio = 0.25;
+
+    /// <summary>
+    /// Recognises a Table-of-Contents row: any content that ends with whitespace + one
+    /// or more digits (the page number). Group 1 is the title, group 2 is the pagenum.
+    /// Used by the TOC-shape re-emit path in <see cref="EmitReplacement"/>.
+    /// </summary>
+    internal static readonly Regex TocRowPattern =
+        new(@"^(.+?)\s+(\d+)\s*$", RegexOptions.Compiled);
+
     private readonly IReadOnlyDictionary<int, SetTextOverlay> _byMcid;
     private readonly WriterFontCache? _fontCache;
 
@@ -58,6 +74,10 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
     private int _activeTargetMcid = -1;
     private bool _replacementEmittedForActiveBlock;
+    // Tag name (without leading '/') of the currently open target BDC. Used by the
+    // TJ→Tc fold guard so headings and table headers don't inherit a folded Tc that
+    // Adobe would surface as a non-zero AV in the Format panel.
+    private string? _activeTargetTag;
     private bool _insideTextObject;
 
     // Snapshots of the most recent Tf/Tm/TL passed-through operator sequences. Re-emitted
@@ -112,6 +132,15 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     // measured against (mid-block Tm resets must not retarget it).
     private IList<PdfObject>? _tmAtFirstTjInBlock;
 
+    // P2 (2026-09-07) leader suppression state. When a TOC-style row is re-emitted with
+    // in-place dots + right-anchored pagenum (see EmitReplacement), the source's original
+    // dot-leader artifact BMC blocks must be silenced or they'd double-print on top of our
+    // fresh leader. Non-null between the target's EMC and the next tagged BDC.
+    private double? _leaderSuppressYMin;
+    private double? _leaderSuppressYMax;
+    private bool _insideArtifactBlock;
+    private bool _suppressCurrentArtifactText;
+
     private ContentStreamMcidReplacer(
         IReadOnlyDictionary<int, SetTextOverlay> byMcid,
         WriterFontCache? fontCache,
@@ -137,6 +166,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         if (originalBytes is null || originalBytes.Length == 0) return;
 
         var resources = page.GetResources();
+        // Rendered-chars scan MUST run before we swap in the empty content stream:
+        // PageFontInventory.Of walks every page of the doc via a content-stream scan
+        // to learn which unicode code points each embedded font actually rendered.
+        // Chars only used on the target page (italic 'A' on Ram p1 Note MCID 6) would
+        // vanish from the scan if we cleared the page first — CanRenderStrict would
+        // then falsely reject the italic subset and the multi-font emitter would
+        // downgrade the glyph to the roman twin, mid-word.
+        var inventory = PageFontInventory.Of(page);
         var freshContent = new PdfStream();
         page.GetPdfObject().Put(PdfName.Contents, freshContent);
         page.GetPdfObject().SetModified();
@@ -149,7 +186,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             _currentPage = page,
             _outCanvas = new PdfCanvas(freshContent, resources, page.GetDocument()),
             _outStream = freshContent.GetOutputStream(),
-            _pageFontInventory = PageFontInventory.Of(page),
+            _pageFontInventory = inventory,
             _currentPageNumber = page.GetDocument().GetPageNumber(page)
         };
         proc.ProcessContent(originalBytes, resources);
@@ -280,15 +317,31 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         if ("BDC".Equals(opName, StringComparison.Ordinal) && operands.Count >= 3)
         {
+            // Any tagged BDC after a modified target's EMC closes the visual row —
+            // stop suppressing leader artifacts.
+            _leaderSuppressYMin = null;
+            _leaderSuppressYMax = null;
             int mcid = ExtractInlineMcid(operands[1]);
             if (_activeTargetMcid < 0 && _byMcid.ContainsKey(mcid))
             {
                 _activeTargetMcid = mcid;
+                _activeTargetTag = operands[0] is PdfName tn ? tn.GetValue() : null;
                 _replacementEmittedForActiveBlock = false;
                 // Snapshot inherited Tc/Tw at BDC entry.
                 _tcAtBdcOpen = _lastTcOperands is null ? null : new List<PdfObject>(_lastTcOperands);
                 _twAtBdcOpen = _lastTwOperands is null ? null : new List<PdfObject>(_lastTwOperands);
             }
+            WriteOperandsAndOperator(operands);
+            return;
+        }
+
+        // Untagged BMC — mark artifact regions so we can silence dot leaders whose
+        // baseline coincides with a just-modified TOC row.
+        if ("BMC".Equals(opName, StringComparison.Ordinal) && operands.Count >= 1)
+        {
+            _insideArtifactBlock = operands[0] is PdfName tag
+                && "Artifact".Equals(tag.GetValue(), StringComparison.Ordinal);
+            _suppressCurrentArtifactText = false;
             WriteOperandsAndOperator(operands);
             return;
         }
@@ -301,6 +354,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 _replacementEmittedForActiveBlock = true;
             }
             _activeTargetMcid = -1;
+            _activeTargetTag = null;
             // Clear per-block first-* so subsequent target MCIDs capture their own state fresh.
             _firstTcInBlock = null;
             _firstTwInBlock = null;
@@ -312,6 +366,39 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             _firstTjAvgKernPer1000 = null;
             WriteOperandsAndOperator(operands);
             return;
+        }
+
+        // Close an artifact BMC (or any untagged marked-content section) — reset the
+        // per-block leader-suppression flag.
+        if ("EMC".Equals(opName, StringComparison.Ordinal) && _insideArtifactBlock)
+        {
+            _insideArtifactBlock = false;
+            _suppressCurrentArtifactText = false;
+            WriteOperandsAndOperator(operands);
+            return;
+        }
+
+        // Inside an artifact BMC on a suppressed Y-band: the first Td/Tm gives the
+        // block's absolute baseline (BT resets Tm to identity). If it matches the
+        // just-modified row's Y, mark subsequent text-showing ops for suppression.
+        if (_insideArtifactBlock
+            && !_suppressCurrentArtifactText
+            && _leaderSuppressYMin is { } yMin
+            && _leaderSuppressYMax is { } yMax)
+        {
+            double? absY = null;
+            if ((opName == "Td" || opName == "TD") && operands.Count >= 2 && operands[1] is PdfNumber tdY)
+            {
+                absY = tdY.DoubleValue();
+            }
+            else if (opName == "Tm" && operands.Count >= 6 && operands[5] is PdfNumber tmY)
+            {
+                absY = tmY.DoubleValue();
+            }
+            if (absY is { } y && y >= yMin && y <= yMax)
+            {
+                _suppressCurrentArtifactText = true;
+            }
         }
 
         if (_activeTargetMcid >= 0 && IsTextRelatedOp(opName))
@@ -328,6 +415,12 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 _firstTjAvgKernPer1000 = AverageTjKerningPer1000(opName, operands);
             }
             // Drop the source's original text op.
+            return;
+        }
+
+        // Drop the text-showing op inside a suppressed artifact block.
+        if (_suppressCurrentArtifactText && IsTextShowingOp(opName))
+        {
             return;
         }
 
@@ -420,7 +513,14 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
         float bboxWidth = (float)overlay.Width;
         float bboxHeight = (float)overlay.Height;
-        var lines = WrapText(overlay.NewContent, font, fontSize, bboxWidth);
+        double spaceShrink = SpaceShrinkPt(overlay, font, fontSize);
+        var lines = WrapText(overlay.NewContent, font, fontSize, bboxWidth, spaceShrink);
+        if (overlay.Alignment == Alignment.Center && overlay.SourceLineWidths is { Count: >= 2 } sourceWidths)
+        {
+            lines = WrapToSourceLineWidths(overlay.NewContent, font, fontSize, sourceWidths)
+                ?? WrapToSourceLineCount(overlay.NewContent, font, fontSize, sourceWidths, bboxWidth)
+                ?? lines;
+        }
         float lineHeight = fontSize * EffectiveLeadingMultiplier(style);
         // Prefer the SOURCE block's observed baseline gap over natural leading: a
         // double-spaced worksheet paragraph re-wrapped at natural leading collapses into
@@ -443,18 +543,15 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
             lines = new List<string> { overlay.NewContent };
         }
 
-        // Multi-line overflow: collapse to single line if vertical doesn't fit above next sibling.
-        if (lines.Count > 1)
+        // Multi-line overflow: collapse to single line if vertical doesn't fit above next
+        // sibling. When there IS no sibling below on the page (NaN), we do NOT cap line
+        // count — the last block on a page is free to grow downward into the margin
+        // (Feedback 1.1 TCC page 3: doubled paragraph at the bottom of the page has no
+        // next sibling; capping by the source's own bbox height collapsed a wrapped
+        // multi-line replacement into a single line that ran under the adjacent image).
+        if (lines.Count > 1 && double.IsFinite(overlay.NextSiblingTopY))
         {
-            float availableDescent;
-            if (double.IsFinite(overlay.NextSiblingTopY))
-            {
-                availableDescent = (float)(baselineY - overlay.NextSiblingTopY) + SiblingOvershootTolerancePt;
-            }
-            else
-            {
-                availableDescent = bboxHeight - lineHeight;
-            }
+            float availableDescent = (float)(baselineY - overlay.NextSiblingTopY) + SiblingOvershootTolerancePt;
             int maxLinesThatFit = 1 + (int)Math.Floor(availableDescent / lineHeight);
             if (lines.Count > maxLinesThatFit)
             {
@@ -485,11 +582,35 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         IList<PdfObject>? emitTcOperands = _firstTcInBlock ?? _tcAtBdcOpen;
         IList<PdfObject>? emitTwOperands = _firstTwInBlock ?? _twAtBdcOpen;
 
-        // Fold source's per-glyph TJ kerning into an equivalent Tc.
-        if (_firstTjAvgKernPer1000 is { } avgKern && Math.Abs(avgKern) > 0.01 && emitTcOperands is not null)
+        // Multi-line justified paragraphs: we restore right-edge alignment via per-line Tw
+        // (see the loop below), so skip the TJ→Tc kerning fold — that fold was designed for
+        // typography kerning (InDesign titles), but a JUSTIFIED paragraph's per-glyph TJ
+        // spread is really justification, not kerning. Folding it here and then re-inflating
+        // Tw would double-space.
+        bool justifyLines = overlay.Alignment == Alignment.Justified
+            && lines.Count > 1
+            && bboxWidth > 0;
+
+        // For heading / table-header tags, force Tc=0 so Adobe's Format panel reads
+        // AV=0 on the modified text — option-b, 2026-09-08. Some sources open the H*
+        // BDC with a small non-zero Tc (e.g. Ram MCID 26 → -0.0182 Tc used only for the
+        // leading digit) and continue with TJ-array kerning for the rest; propagating
+        // either bumps the visible AV. Total glyph-advance delta of zeroing on a heading
+        // is <0.5pt — imperceptible.
+        if (IsHeadingOrHeaderTag(_activeTargetTag))
         {
-            double baseTc = NumFromOperands(emitTcOperands);
-            double effectiveTc = baseTc + avgKern * fontSize / 1000.0;
+            emitTcOperands = new List<PdfObject> { new PdfNumber(0), new PdfLiteral("Tc") };
+        }
+        // Fold source's per-glyph TJ kerning into an equivalent Tc — unless we're about
+        // to Tw-justify (multi-line justified, false positive) OR we already forced Tc=0
+        // above for a heading.
+        else if (!justifyLines
+            && _firstTjAvgKernPer1000 is { } avgKern
+            && Math.Abs(avgKern) > 0.01
+            && emitTcOperands is not null)
+        {
+            double srcTc = NumFromOperands(emitTcOperands);
+            double effectiveTc = srcTc + avgKern * fontSize / 1000.0;
             double rounded = Math.Round(effectiveTc * 10000.0) / 10000.0;
             emitTcOperands = new List<PdfObject>
             {
@@ -500,15 +621,41 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         if (emitTcOperands is not null) WriteOperandsAndOperator(emitTcOperands);
         if (emitTwOperands is not null) WriteOperandsAndOperator(emitTwOperands);
 
+        // Snapshot the base spacing so per-line justification math starts from the
+        // correct source values instead of whatever a prior line left in Tw.
+        double baseTc = emitTcOperands is not null ? NumFromOperands(emitTcOperands) : 0.0;
+        double baseTw = emitTwOperands is not null ? NumFromOperands(emitTwOperands) : 0.0;
+
+        // P2 (2026-09-07): TOC-row detection. A JUSTIFIED single-line replacement whose
+        // content parses as "title <spaces> <digits>" is a Table-of-Contents row. If we
+        // emit the whole string left-anchored (the default), the pagenum ends up in the
+        // middle of the row and the source's dot-leader artifacts still render at their
+        // original X — visually colliding with the modified title (Ram UAT row 7 —
+        // "7.0 Keys and locks .Test.content.added.here .. 10 . . . . ."). Re-emit as
+        // title-at-left + fresh dots + pagenum-right and register a Y-band so the
+        // source's artifact leader ops on this baseline get suppressed downstream.
+        var tocMatch = TocRowPattern.Match(overlay.NewContent ?? string.Empty);
+        bool isTocRow = tocMatch.Success
+            && overlay.Alignment == Alignment.Justified
+            && bboxWidth > 200f
+            && lines.Count == 1;
+
         // Multi-run vs single-style emit.
-        List<InlineSegment>? segments = lines.Count == 1
+        List<InlineSegment>? segments = !isTocRow && lines.Count == 1
             ? SegmentByRuns(lines[0], overlay.SourceRuns, style)
             : null;
 
-        if (segments is not null && segments.Count > 1)
+        if (isTocRow)
+        {
+            EmitTocRow(overlay, font, fontSize, color, baselineY, bboxWidth,
+                tocMatch.Groups[1].Value, tocMatch.Groups[2].Value);
+            _leaderSuppressYMin = baselineY - 3.0;
+            _leaderSuppressYMax = baselineY + 3.0;
+        }
+        else if (segments is not null && segments.Count > 1)
         {
             var line = lines[0];
-            float lineX = AlignedX(overlay, font, fontSize, line);
+            float lineX = AlignedX(overlay, font, fontSize, line, 0);
             _outCanvas.SetTextMatrix(lineX, baselineY);
             foreach (var seg in segments)
             {
@@ -535,16 +682,90 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 ? _fontCache.LoadUniversalFallback(style)
                 : SystemFontLocator.LoadUniversalFallback(style))
                 ?? font;
+            // Zero Tw once up front. We justify multi-line paragraphs via TJ per-space
+            // adjustments (which work for Type 0 composite fonts), so any inherited Tw
+            // would double-space simple-font lines. See MultiFontLineEmitter.EmitRun.
+            if (justifyLines && baseTw != 0.0)
+            {
+                _outStream.WriteString("0 Tw\n");
+                baseTw = 0.0;
+            }
+            // Lines that close a hard-break ('\n') segment end a paragraph of their own and,
+            // like the final line, are left unstretched.
+            var segmentEnds = justifyLines
+                ? SegmentEndLineIndices(overlay.NewContent, font, fontSize, bboxWidth, spaceShrink, lines.Count)
+                : null;
+            // Source inline runs (bold "MOTION by" inside a regular paragraph) that survive
+            // verbatim keep their own face on multi-line edits too — not only single-line ones.
+            var styledLines = _pageFontInventory is not null && lines.Count > 1 && overlay.NewContent is { } newText
+                ? SegmentLines(newText, lines, overlay.SourceRuns, style!)
+                : null;
+            var runFonts = new Dictionary<FontStyle, (PdfFont Font, IReadOnlyList<PdfFont> Pool, PdfFont Fallback)>();
+            (PdfFont Font, IReadOnlyList<PdfFont> Pool, PdfFont Fallback) FontsFor(FontStyle s)
+            {
+                if (ReferenceEquals(s, style)) return (font, pool, universalFallback);
+                if (runFonts.TryGetValue(s, out var cached)) return cached;
+                var f = ResolveRunFont(s, font);
+                var p = !string.IsNullOrWhiteSpace(s.Family)
+                    ? _pageFontInventory!.CandidatesByFamilyAndWeight(s.Family, s.Weight)
+                    : pool;
+                var fb = (_fontCache is not null ? _fontCache.LoadUniversalFallback(s) : SystemFontLocator.LoadUniversalFallback(s))
+                    ?? universalFallback;
+                return runFonts[s] = (f, p, fb);
+            }
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
-                float lineX = AlignedX(overlay, font, fontSize, line);
+                var segs = styledLines?[i];
+                // Per-line justification amount (points of extra advance per word gap).
+                // JustifiedTw already returns 0 on the last line and on lines that already
+                // fill the bbox; we invert its sign here so a POSITIVE extraPt becomes a
+                // NEGATIVE TJ number that ADDS forward advance. A negative extraPt (line
+                // packed with compressed spaces, see SpaceShrinkPt) tightens the gaps.
+                float lineBboxWidth = LineBboxWidth(overlay, bboxWidth, i);
+                // Measure with the fonts the emitter will really use per char, so fallback
+                // glyphs don't skew the slack.
+                double? glyphWidth = null;
+                if (justifyLines && _pageFontInventory is not null)
+                {
+                    glyphWidth = 0.0;
+                    foreach (var seg in segs ?? new List<InlineSegment> { new(line, style!) })
+                    {
+                        var (sf, sp, sfb) = FontsFor(seg.Style);
+                        glyphWidth += MultiFontLineEmitter.MeasureLine(seg.Text, sf, sp, sfb,
+                            fontSize, _pageFontInventory, _currentPage);
+                    }
+                }
+                double extraSpacePt = justifyLines
+                    ? JustifiedTw(line, font, fontSize, lineBboxWidth, baseTc, 0.0,
+                        i == lines.Count - 1 || segmentEnds!.Contains(i), spaceShrink, glyphWidth)
+                    : 0.0;
+                double tjAdj = extraSpacePt != 0 && fontSize > 0
+                    ? -(extraSpacePt * 1000.0 / fontSize)
+                    : 0.0;
+                float lineX = AlignedX(overlay, font, fontSize, line, i);
                 float lineY = baselineY - i * lineHeight;
                 _outCanvas.SetTextMatrix(lineX, lineY);
-                if (_pageFontInventory is not null)
+                if (segs is not null)
+                {
+                    foreach (var seg in segs)
+                    {
+                        var (sf, sp, sfb) = FontsFor(seg.Style);
+                        EmitFillColorRaw(StandardFontMapper.ParseHex(seg.Style.ColorHex));
+                        MultiFontLineEmitter.EmitLine(_outCanvas, seg.Text, sf, sp,
+                            sfb, fontSize, _pageFontInventory!, _currentPage, tjAdj);
+                    }
+                }
+                else if (_pageFontInventory is not null)
                 {
                     MultiFontLineEmitter.EmitLine(_outCanvas, line, font, pool,
-                        universalFallback, fontSize, _pageFontInventory, _currentPage);
+                        universalFallback, fontSize, _pageFontInventory, _currentPage, tjAdj);
+                }
+                else if (tjAdj != 0.0)
+                {
+                    MultiFontLineEmitter.EmitLine(_outCanvas, line, font,
+                        Array.Empty<PdfFont>(), universalFallback, fontSize,
+                        PageFontInventory.Empty, _currentPage, tjAdj);
                 }
                 else
                 {
@@ -590,11 +811,67 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     }
 
     /// <summary>
+    /// TOC-shaped emit path — renders <paramref name="title"/> at the bbox left edge,
+    /// fills the gap with fresh dot leaders, and right-anchors <paramref name="pagenum"/>
+    /// against the bbox right edge. Zeroes out inherited Tc/Tw so the width math matches
+    /// the actual rendering; the shared restore at the bottom of <see cref="EmitReplacement"/>
+    /// puts the source's spacing state back for downstream blocks.
+    /// </summary>
+    private void EmitTocRow(SetTextOverlay overlay, PdfFont font, float fontSize,
+        iText.Kernel.Colors.Color color, float baselineY, float bboxWidth,
+        string title, string pagenum)
+    {
+        // Zero Tc/Tw so title/pagenum width math matches the emitted glyph advance.
+        _outStream.WriteString("0 Tc\n0 Tw\n");
+        EmitFillColorRaw(color);
+        _outCanvas.SetFontAndSize(font, fontSize).SetLeading(fontSize * EffectiveLeadingMultiplier(overlay.Style));
+
+        float leftX = (float)overlay.X;
+        float titleWidth = font.GetWidth(title, fontSize);
+        float pagenumWidth = font.GetWidth(pagenum, fontSize);
+        float pagenumX = leftX + bboxWidth - pagenumWidth;
+
+        // Title at leftmost.
+        _outCanvas.SetTextMatrix(leftX, baselineY);
+        _outCanvas.ShowText(title);
+
+        // Fresh dot leader between title-end (+ breathing gap) and pagenum-start
+        // (- breathing gap). Skip when the title already overruns the pagenum slot.
+        // Emitted as plain "." repeated at natural glyph advance so the pitch matches
+        // the source's dense leader (Ram TOC ~2.8pt pitch); with ". " units the leader
+        // came out at 5.5pt pitch and looked visibly sparser than unedited rows.
+        const float LeaderGap = 4.0f;
+        float leaderStart = leftX + titleWidth + LeaderGap;
+        float leaderEnd = pagenumX - LeaderGap;
+        if (leaderEnd > leaderStart)
+        {
+            float dotWidth = font.GetWidth(".", fontSize);
+            if (dotWidth > 0.1f)
+            {
+                int nDots = (int)((leaderEnd - leaderStart) / dotWidth);
+                if (nDots > 0)
+                {
+                    _outCanvas.SetTextMatrix(leaderStart, baselineY);
+                    _outCanvas.ShowText(new string('.', nDots));
+                }
+            }
+        }
+
+        // Pagenum right-anchored.
+        _outCanvas.SetTextMatrix(pagenumX, baselineY);
+        _outCanvas.ShowText(pagenum);
+    }
+
+    /// <summary>
     /// Greedy word-wrap: pack words into a line while the running measured width fits within
     /// <paramref name="maxWidth"/>. Words wider than the bbox go on their own line (overflow
     /// to the right rather than break mid-word). Empty input yields <c>[""]</c>.
+    /// <paramref name="shrinkPerSpace"/> (pt) lets each space on a line give up that much
+    /// width before the line counts as full — the caller must then emit the line with the
+    /// matching compression (<see cref="JustifiedTw"/>).
     /// </summary>
-    internal static List<string> WrapText(string? text, PdfFont font, float fontSize, float maxWidth)
+    internal static List<string> WrapText(string? text, PdfFont font, float fontSize, float maxWidth,
+        double shrinkPerSpace = 0.0)
     {
         var lines = new List<string>();
         if (string.IsNullOrEmpty(text))
@@ -610,13 +887,85 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         // Split on embedded newlines first so \n becomes an explicit hard break.
         foreach (var segment in text.Split('\n'))
         {
-            WrapSegment(segment, font, fontSize, maxWidth, lines);
+            WrapSegment(segment, font, fontSize, maxWidth, shrinkPerSpace, lines);
         }
         if (lines.Count == 0) lines.Add(string.Empty);
         return lines;
     }
 
-    private static void WrapSegment(string segment, PdfFont font, float fontSize, float maxWidth, List<string> output)
+    /// <summary>
+    /// Re-wrap a CENTER block line by line to the source's own line widths, so a stacked
+    /// title keeps its breaks: the Board Packet p3 H2 is five centered lines inside a 362pt
+    /// bbox, and a greedy wrap to the bbox width collapsed it to three even when the edit
+    /// only changed the date. Line <c>i</c> may hold what source line <c>i</c> held plus a
+    /// small slack for measurement noise (extractor boxes vs <see cref="PdfFont.GetWidth(string, float)"/>).
+    /// Returns null — caller keeps the plain wrap — when the text needs more lines than the
+    /// source had, contains hard breaks, or there are fewer than two source lines.
+    /// </summary>
+    internal static List<string>? WrapToSourceLineWidths(string? text, PdfFont font, float fontSize,
+        IReadOnlyList<double>? lineWidths)
+    {
+        if (lineWidths is not { Count: >= 2 } || string.IsNullOrEmpty(text) || text.Contains('\n')) return null;
+        var lines = new List<string>();
+        var current = new StringBuilder();
+        foreach (var word in text.Split(' '))
+        {
+            if (current.Length == 0)
+            {
+                current.Append(word);
+                continue;
+            }
+            if (lines.Count >= lineWidths.Count) return null;
+            double max = lineWidths[lines.Count] * (1 + SourceLineWidthSlack) + 0.5;
+            var candidate = current + " " + word;
+            if (font.GetWidth(candidate, fontSize) <= max)
+            {
+                current.Append(' ').Append(word);
+            }
+            else
+            {
+                lines.Add(current.ToString());
+                current.Clear().Append(word);
+            }
+        }
+        if (current.Length > 0) lines.Add(current.ToString());
+        return lines.Count <= lineWidths.Count ? lines : null;
+    }
+
+    /// <summary>
+    /// Fallback for <see cref="WrapToSourceLineWidths"/> when the new words no longer fit the
+    /// source's line shapes (Board Packet p3 corpus edit moves "MINUTES" to the end — the
+    /// shaped wrap needs 6 lines): wrap at the narrowest width that still fits the text in
+    /// the source's line count, so a 5-line stacked title stays 5 centered lines instead of
+    /// collapsing to 3 bbox-wide ones. The width never drops below the source's mean line
+    /// width, so a shorter replacement keeps its natural, fewer lines. Null when the plain
+    /// wrap at <paramref name="maxWidth"/> already needs at least the source's line count.
+    /// </summary>
+    internal static List<string>? WrapToSourceLineCount(string? text, PdfFont font, float fontSize,
+        IReadOnlyList<double> lineWidths, float maxWidth)
+    {
+        if (lineWidths.Count < 2 || string.IsNullOrEmpty(text) || text.Contains('\n') || maxWidth <= 0) return null;
+        int target = lineWidths.Count;
+        if (WrapText(text, font, fontSize, maxWidth).Count >= target) return null;
+        double lo = Math.Min(lineWidths.Average(), maxWidth);
+        foreach (var word in text.Split(' ')) lo = Math.Max(lo, font.GetWidth(word, fontSize));
+        double hi = maxWidth;
+        if (WrapText(text, font, fontSize, (float)lo).Count <= target) return WrapText(text, font, fontSize, (float)lo);
+        // Line count is monotone non-increasing in width: bisect to ~0.5pt.
+        while (hi - lo > 0.5)
+        {
+            double mid = (lo + hi) / 2;
+            if (WrapText(text, font, fontSize, (float)mid).Count <= target) hi = mid;
+            else lo = mid;
+        }
+        return WrapText(text, font, fontSize, (float)hi);
+    }
+
+    /// <summary>Relative slack on a source line width in <see cref="WrapToSourceLineWidths"/>.</summary>
+    private const double SourceLineWidthSlack = 0.02;
+
+    private static void WrapSegment(string segment, PdfFont font, float fontSize, float maxWidth,
+        double shrinkPerSpace, List<string> output)
     {
         if (segment.Length == 0)
         {
@@ -625,6 +974,7 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         }
         var words = segment.Split(' ');
         var current = new StringBuilder();
+        int spaces = 0;
         foreach (var word in words)
         {
             if (current.Length == 0)
@@ -633,16 +983,18 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
                 continue;
             }
             var candidate = current.ToString() + " " + word;
-            if (font.GetWidth(candidate, fontSize) <= maxWidth)
+            if (font.GetWidth(candidate, fontSize) - shrinkPerSpace * (spaces + 1) <= maxWidth)
             {
                 current.Clear();
                 current.Append(candidate);
+                spaces++;
             }
             else
             {
                 output.Add(current.ToString());
                 current.Clear();
                 current.Append(word);
+                spaces = 0;
             }
         }
         if (current.Length > 0) output.Add(current.ToString());
@@ -756,25 +1108,137 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     }
 
     /// <summary>
+    /// Compute the word-spacing (<c>Tw</c>) that stretches <paramref name="lineText"/> to
+    /// exactly fill <paramref name="bboxWidth"/>. Last line of a paragraph and lines with
+    /// no spaces or with tolerable natural width fall back to <paramref name="baseTw"/>.
+    /// Every other line is stretched however wide the gaps get — a line that broke early
+    /// before a long word still ends on the right edge, as in Word / Acrobat (Feedback 1.4
+    /// Sample2 Note: line 1 needs ~18pt gaps; the old fontSize/2 cap left it ragged and the
+    /// paragraph read as left-aligned). A line WIDER than the bbox — only possible when the
+    /// wrap packed it with <paramref name="maxShrinkPerSpace"/> — gets a negative
+    /// adjustment, bounded by that same allowance, on every line including the last.
+    /// <paramref name="glyphWidth"/> overrides <paramref name="font"/>'s measurement when the
+    /// line is drawn across several fonts (see <see cref="MultiFontLineEmitter.MeasureLine"/>).
+    /// </summary>
+    internal static double JustifiedTw(string lineText, PdfFont font, float fontSize,
+        float bboxWidth, double baseTc, double baseTw, bool isLastLine, double maxShrinkPerSpace = 0.0,
+        double? glyphWidth = null)
+    {
+        if (isLastLine && maxShrinkPerSpace <= 0) return baseTw;
+        int spaces = 0;
+        for (int i = 0; i < lineText.Length; i++)
+        {
+            if (lineText[i] == ' ') spaces++;
+        }
+        if (spaces == 0) return baseTw;
+        double naturalWidth = (glyphWidth ?? font.GetWidth(lineText, fontSize))
+            + baseTc * Math.Max(0, lineText.Length - 1)
+            + baseTw * spaces;
+        double extra = bboxWidth - naturalWidth;
+        if (extra < 0 && maxShrinkPerSpace > 0)
+        {
+            return baseTw + Math.Max(extra / spaces, -maxShrinkPerSpace);
+        }
+        if (extra <= 0 || isLastLine) return baseTw;
+        return baseTw + extra / spaces;
+    }
+
+    /// <summary>
+    /// Indices into <see cref="WrapText"/>'s output of the lines that close a hard-break
+    /// (<c>'\n'</c>) segment, excluding the final line. Empty when the wrap was collapsed
+    /// (line count no longer matches the per-segment wrap).
+    /// </summary>
+    internal static HashSet<int> SegmentEndLineIndices(string? text, PdfFont font, float fontSize,
+        float maxWidth, double shrinkPerSpace, int lineCount)
+    {
+        var ends = new HashSet<int>();
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0.0f || !text.Contains('\n')) return ends;
+        var scratch = new List<string>();
+        foreach (var segment in text.Split('\n'))
+        {
+            WrapSegment(segment, font, fontSize, maxWidth, shrinkPerSpace, scratch);
+            ends.Add(scratch.Count - 1);
+        }
+        if (scratch.Count != lineCount) return new HashSet<int>();
+        ends.Remove(lineCount - 1);
+        return ends;
+    }
+
+    /// <summary>
     /// Compute the text-matrix X so a single line of the new content sits inside the original
     /// bbox consistently with the node's classified alignment. JUSTIFIED and UNKNOWN fall
     /// through to LEFT for POC.
+    ///
+    /// <paramref name="lineIndex"/> lets the caller opt into a per-line X: when the source
+    /// paragraph's first line is indented past a leading label glyph
+    /// (<see cref="SetTextOverlay.FirstLineX"/>) — e.g. a Note paragraph whose <c>*</c> Lbl
+    /// sits 3.5pt left of the paragraph text — line 0 uses that indent instead of the union
+    /// bbox left edge. Lines 2+ fall back to the union edge.
     /// </summary>
-    private static float AlignedX(SetTextOverlay overlay, PdfFont font, float fontSize, string lineText)
+    private static float AlignedX(SetTextOverlay overlay, PdfFont font, float fontSize, string lineText, int lineIndex = 0)
     {
+        double baseX = overlay.X;
+        double baseWidth = overlay.Width;
+        if (lineIndex == 0 && !double.IsNaN(overlay.FirstLineX))
+        {
+            baseX = overlay.FirstLineX;
+            // Trim the bbox width by the indent so justification math (right anchor / center)
+            // still snaps to the union bbox's right edge, matching how the source paragraph
+            // ends its first line at the same column as subsequent lines.
+            double indent = overlay.FirstLineX - overlay.X;
+            if (indent > 0) baseWidth = Math.Max(0, overlay.Width - indent);
+        }
         var a = overlay.Alignment;
         if (a == Alignment.Left || a == Alignment.Justified || a == Alignment.Unknown)
         {
-            return (float)overlay.X;
+            return (float)baseX;
         }
         float textWidth = font.GetWidth(lineText, fontSize);
-        float bboxWidth = (float)overlay.Width;
+        float bboxWidth = (float)baseWidth;
         if (a == Alignment.Center)
         {
-            return (float)overlay.X + (bboxWidth - textWidth) / 2f;
+            return (float)baseX + (bboxWidth - textWidth) / 2f;
         }
         // Right
-        return (float)overlay.X + bboxWidth - textWidth;
+        return (float)baseX + bboxWidth - textWidth;
+    }
+
+    /// <summary>
+    /// Per-line usable bbox width: line 0 may be shortened by the source's
+    /// <see cref="SetTextOverlay.FirstLineX"/> indent (see <see cref="AlignedX"/>) so
+    /// justification math snaps to the same right edge as subsequent lines instead of
+    /// overshooting by the indent amount.
+    /// </summary>
+    /// <summary>
+    /// Points each space may be compressed when re-wrapping a justified paragraph: the
+    /// amount the source's own tightest line sits below the font's natural space width
+    /// (<see cref="SetTextOverlay.SourceMinWordGap"/>), capped at
+    /// <see cref="MaxSpaceShrinkRatio"/>. Zero when the source never compressed, so
+    /// paragraphs laid out at natural-or-wider spacing wrap exactly as before. Without
+    /// this a word the source squeezed onto a line drops to the next one and the line it
+    /// left is stretched to roughly double its gaps (Feedback 1.3). Diverges from Java,
+    /// which always wraps at natural spacing — PORTING_PLAN §9.
+    /// </summary>
+    internal static double SpaceShrinkPt(SetTextOverlay overlay, PdfFont font, float fontSize)
+    {
+        if (overlay.Alignment != Alignment.Justified || !double.IsFinite(overlay.SourceMinWordGap)) return 0.0;
+        double naturalSpace = font.GetWidth(" ", fontSize);
+        double observed = naturalSpace - overlay.SourceMinWordGap;
+        // Sub-0.1pt differences are measurement noise in the extractor's glyph boxes.
+        if (naturalSpace <= 0 || observed < 0.1) return 0.0;
+        // 15% headroom: the source line also carries inter-letter TJ kerning the word-gap
+        // measure cannot see (Sample2 Note line 2: 0.56pt), so the bare observed amount
+        // leaves the source's own tightest line a fraction of a point too wide to re-fit.
+        return Math.Min(observed * 1.15, naturalSpace * MaxSpaceShrinkRatio);
+    }
+
+    private static float LineBboxWidth(SetTextOverlay overlay, float unionWidth, int lineIndex)
+    {
+        if (lineIndex != 0 || double.IsNaN(overlay.FirstLineX)) return unionWidth;
+        double indent = overlay.FirstLineX - overlay.X;
+        if (indent <= 0) return unionWidth;
+        double shortened = overlay.Width - indent;
+        return (float)Math.Max(0, shortened);
     }
 
     private static float ApproxFromHeight(double h)
@@ -792,9 +1256,19 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
     internal sealed record InlineSegment(string Text, FontStyle Style);
 
     /// <summary>
-    /// Decompose <paramref name="line"/> into inline segments, tagging any substring that
-    /// appears verbatim in a source <see cref="TextRun"/> with that run's style. Unmatched
-    /// gaps get the <paramref name="primary"/> style. Runs are matched in source order.
+    /// Decompose <paramref name="line"/> into inline segments, carrying source styling over
+    /// WORD BY WORD: each source word takes the style of its characters, the longest common
+    /// word subsequence (ordinal, order-preserving) aligns source and new words, and every
+    /// new word that aligns keeps its source word's style. Inserted or moved words get the
+    /// <paramref name="primary"/> style; the space between two aligned words that were also
+    /// adjacent in the source keeps the source space's style.
+    ///
+    /// Word-level, not run-level: an edit that changes part of a styled run keeps the rest
+    /// (Board Packet p5: "Resolution No. 4098" is a bold lead-in; the edit moved
+    /// "Resolution" to the end, so "No. 4098" stays bold and the trailing "Resolution" is
+    /// regular). Order-preserving alignment also tells a repeated phrase's occurrences
+    /// apart — the regular "approve Resolution No. 4098." mid-sentence aligns with its own
+    /// regular source occurrence, not the bold lead-in.
     /// </summary>
     internal static List<InlineSegment> SegmentByRuns(string? line, IReadOnlyList<TextRun>? sourceRuns, FontStyle primary)
     {
@@ -802,39 +1276,134 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
         {
             return new List<InlineSegment> { new(line ?? string.Empty, primary) };
         }
-        var matches = new List<(int Start, int End, int RunIndex)>();
-        int searchFrom = 0;
-        for (int i = 0; i < sourceRuns.Count; i++)
+        var src = new StringBuilder();
+        var srcStyle = new List<FontStyle>();
+        foreach (var run in sourceRuns)
         {
-            var run = sourceRuns[i];
-            var needle = run.Text;
-            if (string.IsNullOrEmpty(needle)) continue;
-            int at = line.IndexOf(needle, searchFrom, StringComparison.Ordinal);
-            if (at < 0) continue;
-            matches.Add((at, at + needle.Length, i));
-            searchFrom = at + needle.Length;
+            var st = NormalizeRunStyle(run.Style, primary);
+            src.Append(run.Text);
+            for (int k = 0; k < run.Text.Length; k++) srcStyle.Add(st);
         }
-        if (matches.Count == 0)
+        string source = src.ToString();
+        var sw = WordSpans(source);
+        var nw = WordSpans(line);
+
+        // LCS over word texts.
+        int n = sw.Count, m = nw.Count;
+        bool SameWord(int i, int j) => sw[i].Length == nw[j].Length
+            && string.CompareOrdinal(source, sw[i].Start, line, nw[j].Start, sw[i].Length) == 0;
+        var lcs = new int[n + 1, m + 1];
+        for (int i = n - 1; i >= 0; i--)
         {
-            return new List<InlineSegment> { new(line, primary) };
-        }
-        var output = new List<InlineSegment>();
-        int cursor = 0;
-        foreach (var m in matches)
-        {
-            if (m.Start > cursor) output.Add(new InlineSegment(line[cursor..m.Start], primary));
-            var runStyle = sourceRuns[m.RunIndex].Style;
-            if (runStyle.Size < 4.0f && primary.Size >= 4.0f)
+            for (int j = m - 1; j >= 0; j--)
             {
-                runStyle = new FontStyle(runStyle.Family, primary.Size,
-                    runStyle.Weight, runStyle.ColorHex,
-                    runStyle.SourceFontObjNumber, runStyle.LeadingRatio);
+                lcs[i, j] = SameWord(i, j)
+                    ? lcs[i + 1, j + 1] + 1
+                    : Math.Max(lcs[i + 1, j], lcs[i, j + 1]);
             }
-            output.Add(new InlineSegment(line[m.Start..m.End], runStyle));
-            cursor = m.End;
         }
-        if (cursor < line.Length) output.Add(new InlineSegment(line[cursor..], primary));
+
+        var charStyle = new FontStyle[line.Length];
+        Array.Fill(charStyle, primary);
+        int si = 0, ni = 0, prevS = -2, prevN = -2;
+        while (si < n && ni < m)
+        {
+            if (SameWord(si, ni) && lcs[si, ni] == lcs[si + 1, ni + 1] + 1)
+            {
+                var st = srcStyle[sw[si].Start];
+                for (int k = 0; k < nw[ni].Length; k++) charStyle[nw[ni].Start + k] = st;
+                // Gap between two aligned words that were adjacent in the source too.
+                if (prevS == si - 1 && prevN == ni - 1 && sw[si].Start > sw[prevS].End)
+                {
+                    var gapStyle = srcStyle[sw[prevS].End];
+                    for (int k = nw[prevN].End; k < nw[ni].Start; k++) charStyle[k] = gapStyle;
+                }
+                prevS = si++;
+                prevN = ni++;
+            }
+            else if (lcs[si + 1, ni] >= lcs[si, ni + 1]) si++;
+            else ni++;
+        }
+
+        var output = new List<InlineSegment>();
+        int segStart = 0;
+        for (int k = 1; k <= line.Length; k++)
+        {
+            if (k == line.Length || !charStyle[k].Equals(charStyle[segStart]))
+            {
+                output.Add(new InlineSegment(line[segStart..k], charStyle[segStart]));
+                segStart = k;
+            }
+        }
         return output;
+    }
+
+    /// <summary>
+    /// A run's style as a segment style: the <paramref name="primary"/> instance itself when
+    /// they differ only in leading (captured per text event — not a face difference), and
+    /// the primary's size when the run's own size is unknown (Tf 1 + Tm-scaled producers).
+    /// </summary>
+    private static FontStyle NormalizeRunStyle(FontStyle runStyle, FontStyle primary)
+    {
+        if ((runStyle with { LeadingRatio = primary.LeadingRatio }).Equals(primary)) return primary;
+        if (runStyle.Size < 4.0f && primary.Size >= 4.0f)
+        {
+            runStyle = runStyle with { Size = primary.Size };
+            if ((runStyle with { LeadingRatio = primary.LeadingRatio }).Equals(primary)) return primary;
+        }
+        return runStyle;
+    }
+
+    /// <summary>Non-whitespace word spans of <paramref name="text"/>.</summary>
+    private static List<(int Start, int Length, int End)> WordSpans(string text)
+    {
+        var spans = new List<(int, int, int)>();
+        int i = 0;
+        while (i < text.Length)
+        {
+            while (i < text.Length && char.IsWhiteSpace(text[i])) i++;
+            int start = i;
+            while (i < text.Length && !char.IsWhiteSpace(text[i])) i++;
+            if (i > start) spans.Add((start, i - start, i));
+        }
+        return spans;
+    }
+
+    /// <summary>
+    /// Per-line inline segments for a multi-line replacement: <see cref="SegmentByRuns"/>
+    /// over the WHOLE new text (a source run can straddle a wrap point), sliced at each
+    /// wrapped line's span. Null when no surviving run differs from <paramref name="primary"/>
+    /// or a line can't be located in the text (callers then emit lines in one style).
+    /// </summary>
+    internal static List<List<InlineSegment>>? SegmentLines(string text, IReadOnlyList<string> lines,
+        IReadOnlyList<TextRun>? sourceRuns, FontStyle primary)
+    {
+        var whole = SegmentByRuns(text, sourceRuns, primary);
+        if (whole.All(s => s.Style.Equals(primary))) return null;
+        var spans = new List<(int Start, int End, FontStyle Style)>();
+        int pos = 0;
+        foreach (var seg in whole)
+        {
+            spans.Add((pos, pos + seg.Text.Length, seg.Style));
+            pos += seg.Text.Length;
+        }
+        var result = new List<List<InlineSegment>>(lines.Count);
+        int cursor = 0;
+        foreach (var line in lines)
+        {
+            int start = line.Length == 0 ? cursor : text.IndexOf(line, cursor, StringComparison.Ordinal);
+            if (start < 0) return null;
+            int end = start + line.Length;
+            var lineSegs = new List<InlineSegment>();
+            foreach (var (s, e, st) in spans)
+            {
+                int a = Math.Max(s, start), b = Math.Min(e, end);
+                if (a < b) lineSegs.Add(new InlineSegment(text[a..b], st));
+            }
+            result.Add(lineSegs);
+            cursor = end;
+        }
+        return result;
     }
 
     /// <summary>
@@ -905,6 +1474,18 @@ internal sealed class ContentStreamMcidReplacer : PdfCanvasProcessor
 
     private static bool IsTextShowingOp(string name)
         => name == "Tj" || name == "TJ" || name == "'" || name == "\"";
+
+    /// <summary>
+    /// True for the PDF structure tags whose modified text should NOT inherit a folded
+    /// TJ→Tc value (H1–H6, TH). Called from the fold guard in EmitReplacement.
+    /// </summary>
+    internal static bool IsHeadingOrHeaderTag(string? tag)
+    {
+        if (string.IsNullOrEmpty(tag)) return false;
+        if (tag == "TH") return true;
+        if (tag.Length == 2 && tag[0] == 'H' && tag[1] >= '1' && tag[1] <= '6') return true;
+        return false;
+    }
 
     /// <summary>First numeric operand as a double, or 0.0 on null/empty/non-number.</summary>
     private static double NumFromOperands(IList<PdfObject>? operands)

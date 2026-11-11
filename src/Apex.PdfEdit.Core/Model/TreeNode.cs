@@ -29,6 +29,15 @@ public sealed class TreeNode
     public bool IsArtifact { get; set; }
     public string? Status { get; set; }
 
+    /// <summary>
+    /// Per-line bounding boxes within the MCID region, in top-to-bottom order. When
+    /// non-empty the writer uses <c>Boxes[0].X</c> for line 0 of a replacement so a
+    /// paragraph whose first line is indented past a leading label glyph (e.g. Note
+    /// paragraphs on Ram p1 whose <c>*</c> Lbl sits 3.5pt left of the paragraph text)
+    /// keeps that indent. <see cref="X"/> / <see cref="Width"/> stay the union bbox.
+    /// </summary>
+    public List<TreeBox>? Boxes { get; set; }
+
     // Table-related accessibility attributes. Populated by the extractor from the
     // source StructElem's Attributes dict; consumed by OcrRevectorizeWriter's
     // applyStructAttrs so freshly-rebuilt TH/TD/Table StructElems carry the same
@@ -50,4 +59,17 @@ public sealed class TreeNode
 
     /// <summary>Human-readable Table summary. Emitted as /Summary text attribute on Table StructElem when non-empty.</summary>
     public string? TableSummary { get; set; }
+}
+
+/// <summary>
+/// A per-line box within a <see cref="TreeNode"/>'s MCID region — one entry per visual
+/// text line. The customer's document.json carries these as <c>boxes</c> on each node.
+/// </summary>
+public sealed class TreeBox
+{
+    public double X { get; set; }
+    public double Y { get; set; }
+    public double Width { get; set; }
+    public double Height { get; set; }
+    public int Page { get; set; }
 }

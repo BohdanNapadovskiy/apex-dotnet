@@ -1,3 +1,5 @@
+using Apex.PdfEdit.Core.Edit;
+using Apex.PdfEdit.Core.Layout;
 using Apex.PdfEdit.Core.Writer;
 using FluentAssertions;
 using iText.IO.Font.Constants;
@@ -212,7 +214,10 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
         var b = new FontStyle("B", 10f, "regular", "#000000");
         var sourceRuns = new List<TextRun> { new("first", a), new("second", b) };
         var segs = ContentStreamMcidReplacer.SegmentByRuns("second then first", sourceRuns, a);
-        segs.Select(s => s.Text).Should().Equal("second then ", "first");
+        // The two words swapped order: an order-preserving alignment can keep at most one,
+        // so "second" can't both keep style B and have "first" aligned after it.
+        string.Concat(segs.Select(s => s.Text)).Should().Be("second then first");
+        segs.Count(s => s.Style == b).Should().BeLessThanOrEqualTo(1);
     }
 
     [Fact]
@@ -229,6 +234,267 @@ public sealed class ContentStreamMcidReplacerWrapTests : IClassFixture<ContentSt
         segs.Should().HaveCount(3);
         segs[1].Style.Family.Should().Be("Times-Bold");
         segs[1].Style.Size.Should().Be(12f);
+    }
+
+    // justifiedTw
+
+    [Fact]
+    public void JustifiedTwLastLineReturnsBaseTw()
+    {
+        // Typographic convention: the paragraph's final line stays left-anchored, so no
+        // extra word spacing regardless of how short the line is.
+        ContentStreamMcidReplacer.JustifiedTw(
+            "trailing", _helvetica, 12f, 500f, baseTc: 0.0, baseTw: 0.5, isLastLine: true)
+            .Should().Be(0.5);
+    }
+
+    [Fact]
+    public void JustifiedTwLineWithoutSpacesReturnsBaseTw()
+    {
+        ContentStreamMcidReplacer.JustifiedTw(
+            "singleword", _helvetica, 12f, 500f, baseTc: 0.0, baseTw: 0.0, isLastLine: false)
+            .Should().Be(0.0);
+    }
+
+    [Fact]
+    public void JustifiedTwStretchesShortLineToBboxWidth()
+    {
+        // Slack per space stays inside the fontSize/2 sanity cap → helper divides it evenly.
+        var line = "aa bb cc";
+        float fontSize = 12f;
+        int spaces = line.Count(c => c == ' ');
+        double perSpace = 5.0;
+        double natural = _helvetica.GetWidth(line, fontSize);
+        float bboxWidth = (float)(natural + perSpace * spaces);
+        double tw = ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: false);
+        tw.Should().BeApproximately(perSpace, 0.001);
+    }
+
+    [Fact]
+    public void JustifiedTwStretchesNonFinalLineEvenWithWideGaps()
+    {
+        // A mid-paragraph line that broke early before a long word must still reach the
+        // right edge (Feedback 1.4: the old fontSize/2 cap left it ragged, reading as LEFT).
+        const string line = "a b";
+        double natural = _helvetica.GetWidth(line, 12f);
+        double tw = ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize: 12f, bboxWidth: 240f,
+            baseTc: 0.0, baseTw: 0.0, isLastLine: false);
+        tw.Should().BeApproximately(240.0 - natural, 0.001);
+    }
+
+    [Fact]
+    public void WrapToSourceLineWidthsKeepsStackedTitleBreaks()
+    {
+        // Board Packet p3 H2 shape: each source line narrower than the widest one. A greedy
+        // wrap to the widest width merges lines; the shaped wrap keeps every break.
+        string[] source = { "MINUTES OF THE", "SPECIAL MEETING OF THE", "HOUSING AUTHORITY OF THE COUNTY", "April 11, 2025" };
+        var widths = source.Select(l => (double)_helvetica.GetWidth(l, 12f)).ToList();
+        string edited = string.Join(' ', source).Replace("11", "18");
+
+        ContentStreamMcidReplacer.WrapToSourceLineWidths(edited, _helvetica, 12f, widths)
+            .Should().Equal("MINUTES OF THE", "SPECIAL MEETING OF THE", "HOUSING AUTHORITY OF THE COUNTY", "April 18, 2025");
+        ContentStreamMcidReplacer.WrapText(edited, _helvetica, 12f, (float)widths.Max())
+            .Should().HaveCountLessThan(source.Length, "the plain wrap is what collapsed the title");
+    }
+
+    [Fact]
+    public void WrapToSourceLineWidthsDeclinesWhenTextNeedsMoreLinesThanSource()
+    {
+        var widths = new List<double> { _helvetica.GetWidth("aaa bbb", 12f), _helvetica.GetWidth("ccc", 12f) };
+        ContentStreamMcidReplacer.WrapToSourceLineWidths("aaa bbb ccc ddd", _helvetica, 12f, widths).Should().BeNull();
+        ContentStreamMcidReplacer.WrapToSourceLineWidths("aaa\nbbb", _helvetica, 12f, widths).Should().BeNull();
+        ContentStreamMcidReplacer.WrapToSourceLineWidths("aaa bbb", _helvetica, 12f, new List<double> { 100 }).Should().BeNull();
+    }
+
+    [Fact]
+    public void WrapToSourceLineCountKeepsTheSourceRowCountForReorderedText()
+    {
+        // Board Packet p3 corpus edit: same words, "MINUTES" moved to the end, so the
+        // shaped wrap overflows; the source's 5 rows must still come out as 5, not 3.
+        string[] source = { "MINUTES OF THE", "SPECIAL MEETING OF THE", "BOARD OF COMMISSIONERS OF THE",
+            "HOUSING AUTHORITY OF THE COUNTY OF SANTA BARBARA", "April 11, 2025" };
+        var widths = source.Select(l => (double)_helvetica.GetWidth(l, 12f)).ToList();
+        float bbox = (float)widths.Max();
+        string reordered = string.Join(' ', source).Replace("MINUTES ", "") + " MINUTES";
+
+        ContentStreamMcidReplacer.WrapToSourceLineWidths(reordered, _helvetica, 12f, widths).Should().BeNull();
+        ContentStreamMcidReplacer.WrapText(reordered, _helvetica, 12f, bbox).Should().HaveCountLessThan(5);
+        var lines = ContentStreamMcidReplacer.WrapToSourceLineCount(reordered, _helvetica, 12f, widths, bbox);
+        lines.Should().NotBeNull().And.HaveCount(5);
+        string.Join(' ', lines!).Should().Be(reordered);
+    }
+
+    [Fact]
+    public void WrapToSourceLineCountLeavesShortReplacementOnFewerLines()
+    {
+        var widths = new List<double> { 100, 160, 220, 360, 75 };
+        var lines = ContentStreamMcidReplacer.WrapToSourceLineCount("MINUTES OF THE MEETING", _helvetica, 12f, widths, 360f);
+        lines.Should().ContainSingle("the width floor (mean source line) keeps a short title on one line");
+    }
+
+    private static readonly FontStyle Regular = new("TimesNewRomanPSMT", 12f, "regular", "#000000");
+    private static readonly FontStyle Bold = new("TimesNewRomanPS-BoldMT", 12f, "bold", "#000000");
+
+    [Fact]
+    public void SegmentByRunsKeepsUnchangedWordsOfAStyledRunAndDropsMovedOnes()
+    {
+        // Board Packet p5: bold lead-in "Resolution No. 4098"; the edit moved "Resolution"
+        // to the end. "No. 4098" is unchanged → stays bold; the trailing "Resolution" and
+        // the regular mid-sentence "Resolution No. 4098." stay regular; "MOTION by" bold.
+        var runs = new List<TextRun>
+        {
+            new("Resolution No. 4098", Bold),
+            new(" - Payment Standards. ", Regular),
+            new("MOTION by", Bold),
+            new(" Commissioner Alonso to approve Resolution No. 4098.", Regular),
+        };
+        var segs = ContentStreamMcidReplacer.SegmentByRuns(
+            "No. 4098 - Payment Standards MOTION by Commissioner Alonso to approve Resolution No. 4098. Resolution",
+            runs, Regular);
+
+        segs.Where(s => s.Style == Bold).Select(s => s.Text).Should().Equal("No. 4098", "MOTION by");
+        string.Concat(segs.Select(s => s.Text)).Should().EndWith("approve Resolution No. 4098. Resolution");
+    }
+
+    [Fact]
+    public void SegmentLinesSlicesRunsAcrossWrappedLines()
+    {
+        var runs = new List<TextRun> { new("Lead in", Bold), new(" body text here", Regular) };
+        const string text = "Lead in body text here";
+        var lines = new[] { "Lead", "in body", "text here" };
+
+        var perLine = ContentStreamMcidReplacer.SegmentLines(text, lines, runs, Regular);
+
+        perLine.Should().NotBeNull().And.HaveCount(3);
+        perLine![0].Should().ContainSingle().Which.Should().Be(new ContentStreamMcidReplacer.InlineSegment("Lead", Bold));
+        perLine[1].Select(s => (s.Text, s.Style == Bold)).Should().Equal(("in", true), (" body", false));
+        perLine[2].Should().OnlyContain(s => s.Style == Regular);
+    }
+
+    [Fact]
+    public void SegmentLinesIsNullWhenNoRunChangesStyle()
+    {
+        var runs = new List<TextRun> { new("abc", Regular), new(" def", Regular) };
+        ContentStreamMcidReplacer.SegmentLines("abc def", new[] { "abc", "def" }, runs, Regular).Should().BeNull();
+    }
+
+    [Fact]
+    public void SegmentEndLineIndicesMarksLinesBeforeHardBreaks()
+    {
+        const string text = "one two three four five six\nseven eight\nnine";
+        float width = _helvetica.GetWidth("one two three", 12f) + 1f;
+        var lines = ContentStreamMcidReplacer.WrapText(text, _helvetica, 12f, width);
+        lines.Should().Equal("one two three", "four five six", "seven eight", "nine");
+        ContentStreamMcidReplacer.SegmentEndLineIndices(text, _helvetica, 12f, width, 0.0, lines.Count)
+            .Should().BeEquivalentTo(new[] { 1, 2 }, "the final line is handled by isLastLine");
+    }
+
+    [Fact]
+    public void JustifiedTwZeroExtraReturnsBaseTw()
+    {
+        // Line already fills the bbox → no inflation needed.
+        var line = "quick brown fox";
+        float fontSize = 12f;
+        float bboxWidth = (float)_helvetica.GetWidth(line, fontSize);
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.25, isLastLine: false)
+            .Should().Be(0.25);
+    }
+
+    // space compression (Feedback 1.3)
+
+    [Fact]
+    public void WrapTextPacksOneMoreWordWhenSpacesMayShrink()
+    {
+        // "aa bb cc" misses the bbox by 1pt at natural spacing; 0.6pt off each of its two
+        // spaces makes it fit.
+        float fontSize = 12f;
+        float maxWidth = _helvetica.GetWidth("aa bb cc", fontSize) - 1f;
+        ContentStreamMcidReplacer.WrapText("aa bb cc", _helvetica, fontSize, maxWidth)
+            .Should().Equal("aa bb", "cc");
+        ContentStreamMcidReplacer.WrapText("aa bb cc", _helvetica, fontSize, maxWidth, shrinkPerSpace: 0.6)
+            .Should().Equal("aa bb cc");
+        ContentStreamMcidReplacer.WrapText("aa bb cc", _helvetica, fontSize, maxWidth, shrinkPerSpace: 0.4)
+            .Should().Equal("aa bb", "cc");
+    }
+
+    [Fact]
+    public void JustifiedTwCompressesOverfullLineWithinAllowance()
+    {
+        var line = "aa bb cc";
+        float fontSize = 12f;
+        float bboxWidth = _helvetica.GetWidth(line, fontSize) - 1f;
+        // Needs -0.5pt per space; allowed.
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: false, maxShrinkPerSpace: 0.6)
+            .Should().BeApproximately(-0.5, 0.001);
+        // The last line is compressed too — the wrap may have packed it the same way.
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: true, maxShrinkPerSpace: 0.6)
+            .Should().BeApproximately(-0.5, 0.001);
+        // Never beyond the allowance.
+        ContentStreamMcidReplacer.JustifiedTw(
+            line, _helvetica, fontSize, bboxWidth, baseTc: 0.0, baseTw: 0.0, isLastLine: false, maxShrinkPerSpace: 0.2)
+            .Should().BeApproximately(-0.2, 0.001);
+    }
+
+    [Fact]
+    public void JustifiedTwLastLineStaysUnstretchedWhenShrinkAllowed()
+    {
+        ContentStreamMcidReplacer.JustifiedTw(
+            "aa bb cc", _helvetica, 12f, 500f, baseTc: 0.0, baseTw: 0.0, isLastLine: true, maxShrinkPerSpace: 0.6)
+            .Should().Be(0.0);
+    }
+
+    [Fact]
+    public void SpaceShrinkOnlyWhenJustifiedSourceCompressedItsSpaces()
+    {
+        float fontSize = 9f;
+        double natural = _helvetica.GetWidth(" ", fontSize);
+        SetTextOverlay Overlay(Alignment alignment, double minGap) => new(
+            1, 0, 0, 400, 30, "text", new FontStyle("Helvetica", 9f, "normal", "#000000"), alignment, "n", 0,
+            double.NaN, double.NaN, Array.Empty<TextRun>(), SourceMinWordGap: minGap);
+
+        // Source tightest line 0.3pt under natural → that much plus headroom.
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, natural - 0.3), _helvetica, fontSize)
+            .Should().BeApproximately(0.345, 0.001);
+        // Source at or above natural spacing, unknown, or not justified → never compress.
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, natural + 1.0), _helvetica, fontSize)
+            .Should().Be(0.0);
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, double.NaN), _helvetica, fontSize)
+            .Should().Be(0.0);
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Left, natural - 0.3), _helvetica, fontSize)
+            .Should().Be(0.0);
+        // Capped at a quarter of the space however tight the source looks.
+        ContentStreamMcidReplacer.SpaceShrinkPt(Overlay(Alignment.Justified, natural * 0.2), _helvetica, fontSize)
+            .Should().BeApproximately(natural * 0.25, 0.001);
+    }
+
+    // isHeadingOrHeaderTag
+
+    [Theory]
+    [InlineData("H1", true)]
+    [InlineData("H2", true)]
+    [InlineData("H3", true)]
+    [InlineData("H4", true)]
+    [InlineData("H5", true)]
+    [InlineData("H6", true)]
+    [InlineData("TH", true)]
+    [InlineData("P", false)]
+    [InlineData("Note", false)]
+    [InlineData("Link", false)]
+    [InlineData("LBody", false)]
+    [InlineData("TD", false)]          // table data cell — not TH
+    [InlineData("Hx", false)]          // invalid heading level
+    [InlineData("H", false)]           // just 'H'
+    [InlineData("H12", false)]         // > 6
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsHeadingOrHeaderTagRecognisesTheExpectedShapes(string? tag, bool expected)
+    {
+        ContentStreamMcidReplacer.IsHeadingOrHeaderTag(tag).Should().Be(expected);
     }
 
     private static IList<PdfObject> TfOps(string fontName, double size)

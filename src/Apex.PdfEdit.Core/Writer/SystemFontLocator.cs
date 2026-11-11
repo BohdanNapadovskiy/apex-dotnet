@@ -154,8 +154,10 @@ public static class SystemFontLocator
         bool bold = string.Equals(weight, "bold", StringComparison.OrdinalIgnoreCase)
                     || w.Contains("bold", StringComparison.Ordinal) || w.Contains("black", StringComparison.Ordinal)
                     || stem.Contains("bold", StringComparison.Ordinal) || stem.Contains("black", StringComparison.Ordinal);
-        bool italic = w.Contains("italic", StringComparison.Ordinal) || w.Contains("oblique", StringComparison.Ordinal)
-                      || stem.Contains("italic", StringComparison.Ordinal) || stem.Contains("oblique", StringComparison.Ordinal);
+        // Italic is read off the FULL family name: FamilyStem cuts at ',' / '-', so the
+        // stem of "Arial,Italic" / "Arial-ItalicMT" is plain "arial" and the slant was lost
+        // (Feedback 1.4 Sample2: fallback glyphs came out in upright ArialMT).
+        bool italic = PageFontInventory.IsItalicName(weight) || PageFontInventory.IsItalicName(family);
         return Current switch
         {
             Platform.Windows => WindowsCandidates(bucket, bold, italic),

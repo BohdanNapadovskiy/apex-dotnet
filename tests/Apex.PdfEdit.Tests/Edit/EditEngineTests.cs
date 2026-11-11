@@ -472,6 +472,40 @@ public sealed class EditEngineTests
     }
 
     [Fact]
+    public void SourceMinWordGapReportsTightestLine()
+    {
+        // Feedback 1.3: two full lines, 10pt glyphs. Line 1 words sit 3pt apart, line 2
+        // 2pt apart (compressed); letter gaps (0.05pt) are not word gaps. The one-word
+        // last line contributes nothing.
+        List<Glyph> Line(double y, double wordGap)
+        {
+            var glyphs = new List<Glyph>();
+            double x = 100;
+            for (int w = 0; w < 4; w++)
+            {
+                glyphs.Add(GlyphAt(x, y, 20, 10));
+                glyphs.Add(GlyphAt(x + 20.05, y, 20, 10));
+                x += 40.05 + wordGap;
+            }
+            return glyphs;
+        }
+        var glyphs = Line(700, 3.0);
+        glyphs.AddRange(Line(688, 2.0));
+        glyphs.Add(GlyphAt(100, 676, 20, 10));
+        var geom = new GeometryJson
+        {
+            PageMcidWords = new Dictionary<string, Dictionary<string, List<Glyph>>>
+            {
+                ["1"] = new() { ["6"] = glyphs, ["7"] = new() { GlyphAt(100, 600, 300, 10) } }
+            }
+        };
+
+        EditEngine.SourceMinWordGap(geom, 1, 6).Should().BeApproximately(2.0, 1e-6);
+        double.IsNaN(EditEngine.SourceMinWordGap(geom, 1, 7)).Should().BeTrue();
+        double.IsNaN(EditEngine.SourceMinWordGap(null, 1, 6)).Should().BeTrue();
+    }
+
+    [Fact]
     public void AddParagraphPushDownShiftsOrphanGeometryMcids()
     {
         var doc = ThreeParagraphSect();
@@ -1406,5 +1440,67 @@ public sealed class EditEngineTests
         }
 
         public ICollection<EventType> GetSupportedEvents() => Supported;
+    }
+
+    [Fact]
+    public void FirstLineIndentXKeepsALeftAnchoredIndent()
+    {
+        // Sample2 Note: '*' label left of line 0; lines 1-2 on the union edge.
+        var note = new TreeNode
+        {
+            X = 84.984,
+            Boxes = new List<TreeBox>
+            {
+                new() { X = 88.485, Width = 438.0 }, new() { X = 84.984, Width = 441.7 }, new() { X = 84.984, Width = 35.1 }
+            }
+        };
+        EditEngine.FirstLineIndentX(note, Alignment.Justified).Should().Be(88.485);
+    }
+
+    [Fact]
+    public void FirstLineIndentXIgnoresCenteredLineStarts()
+    {
+        // Board Packet p3 H2: each centered line starts at its own X — line 0's x=254 is not
+        // an indent. Ignored both by alignment and by the later lines not sharing an edge.
+        var title = new TreeNode
+        {
+            X = 124.8,
+            Boxes = new List<TreeBox>
+            {
+                new() { X = 254.0, Width = 104.0 }, new() { X = 225.4, Width = 161.0 }, new() { X = 124.8, Width = 362.1 }
+            }
+        };
+        EditEngine.FirstLineIndentX(title, Alignment.Center).Should().Be(double.NaN);
+        EditEngine.FirstLineIndentX(title, Alignment.Unknown).Should().Be(double.NaN);
+    }
+
+    [Fact]
+    public void DominantRunStyleIgnoresABoldLeadIn()
+    {
+        // Board Packet p5 node 190: first run is the bold "Resolution No. 4098", but the
+        // paragraph body is regular — the replacement must not render all-bold.
+        var bold = new FontStyle("TimesNewRomanPS-BoldMT", 12f, "bold", "#000000", 11, 1.15f);
+        var regular = new FontStyle("TimesNewRomanPSMT", 12f, "regular", "#000000", 12, 0f);
+        var runs = new List<Apex.PdfEdit.Core.Writer.TextRun>
+        {
+            new Apex.PdfEdit.Core.Writer.TextRun("Resolution No. 4098", bold),
+            new Apex.PdfEdit.Core.Writer.TextRun(" - 2025 Payment Standards. ", regular),
+            new Apex.PdfEdit.Core.Writer.TextRun("MOTION by", bold),
+            new Apex.PdfEdit.Core.Writer.TextRun(" Commissioner Alonso, seconded by Commissioner Mercado.", regular),
+        };
+
+        var style = EditEngine.DominantRunStyle(bold, runs);
+
+        style.Weight.Should().Be("regular");
+        style.SourceFontObjNumber.Should().Be(12);
+        style.LeadingRatio.Should().Be(1.15f, "leading comes from the block, not the run");
+    }
+
+    [Fact]
+    public void DominantRunStyleKeepsPrimaryForSingleRun()
+    {
+        var primary = new FontStyle("Arial", 10f, "regular", "#000000");
+        EditEngine.DominantRunStyle(primary, new List<Apex.PdfEdit.Core.Writer.TextRun> { new Apex.PdfEdit.Core.Writer.TextRun("x", primary with { Weight = "bold" }) })
+            .Should().BeSameAs(primary);
     }
 }
